@@ -50,7 +50,7 @@ impl EditEntry {
         }
     }
 
-    /// 목록용 짧은 워크트리 이름: `abc-web-apps-gh2171` → `gh2171`, 메인 레포는 `main`.
+    /// 목록용 짧은 워크트리 이름: `myrepo-gh123` → `gh123`, 메인 레포는 `main`.
     pub fn label(&self) -> String {
         let Some(root) = &self.root else { return "-".into() };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
