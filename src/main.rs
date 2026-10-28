@@ -1,6 +1,7 @@
 mod bg;
 mod git;
 mod highlight;
+mod ide;
 mod replay;
 mod rows;
 mod session;
@@ -19,7 +20,7 @@ use ratatui::{
     crossterm::{
         event::{
             self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-            MouseEvent, MouseEventKind,
+            MouseButton, MouseEvent, MouseEventKind,
         },
         execute,
     },
@@ -31,6 +32,7 @@ use ratatui::{
 use bg::{run_git, GitDone, GitReq, GitWorker, HlJob, HlWorker};
 use git::{query, CommitState, GitIndex};
 use highlight::Highlighter;
+use ide::Ide;
 use replay::{Replay, Step};
 use rows::{apply_highlight, build_rows, Row, RowKind};
 use session::{bash_roots, parse_entry, EditEntry, Tail};
@@ -54,6 +56,19 @@ pub struct FileView {
     /// 다음 그리기에서 첫 변경 줄로 스크롤한다.
     pub jump: bool,
     pub replay: Option<Replay>,
+}
+
+/// diff 에서 고른 줄 범위(줄 목록 인덱스). anchor 는 고르기 시작한 줄.
+pub struct Sel {
+    pub key: usize,
+    pub anchor: usize,
+    pub head: usize,
+}
+
+impl Sel {
+    pub fn range(&self) -> (usize, usize) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
 }
 
 pub struct App {
@@ -94,6 +109,15 @@ pub struct App {
     pub show_old_wt: bool,
     /// 펼친 워크트리 그룹. 기본은 접힘이고, 펼친 것만 실행 사이에 기억한다.
     expanded: HashSet<Option<PathBuf>>,
+    pub sel: Option<Sel>,
+    dragging: bool,
+    /// 그리기 때 채운다: diff 칸 안쪽 화면 줄마다 (항목 키, 줄 인덱스).
+    pub diff_rows: Vec<Option<(usize, usize)>>,
+    pub ide: Option<Ide>,
+    /// Claude 에 마지막으로 보낸 선택 줄 수(상태줄 표시용).
+    pub sent: Option<usize>,
+    /// 세션이 돈 디렉터리 — Claude 가 IDE 후보를 고를 때 이것을 품는 workspaceFolders 만 보여 준다.
+    cwd: Option<PathBuf>,
 }
 
 fn same_change(a: &EditEntry, b: &EditEntry) -> bool {
@@ -130,8 +154,17 @@ impl App {
             if self.session_start == 0 {
                 self.session_start = session::line_epoch(&line);
             }
+            if let Some(cwd) = session::line_cwd(&line) {
+                if let Some(ide) = self.ide.as_mut() {
+                    ide.add_folder(&cwd);
+                }
+                self.cwd.get_or_insert(cwd);
+            }
             for r in bash_roots(&line, &mut self.roots) {
                 if !self.wt_roots.contains(&r) {
+                    if let Some(ide) = self.ide.as_mut() {
+                        ide.add_folder(&r);
+                    }
                     self.wt_roots.push(r);
                     self.wt_at = None;
                 }
@@ -139,6 +172,9 @@ impl App {
             if let Some(e) = parse_entry(&line, &mut self.roots) {
                 if let Some(r) = &e.root {
                     if !self.wt_roots.contains(r) {
+                        if let Some(ide) = self.ide.as_mut() {
+                            ide.add_folder(r);
+                        }
                         self.wt_roots.push(r.clone());
                         self.wt_at = None;
                     }
@@ -506,8 +542,115 @@ impl App {
         }
     }
 
+    fn row_at(&self, y: u16) -> Option<(usize, usize)> {
+        let i = y.checked_sub(self.diff_area.y + 1)? as usize;
+        self.diff_rows.get(i).copied().flatten()
+    }
+
+    /// 드래그로 줄을 고른다. 손을 떼면 Claude 에 보낸다.
+    /// 화면 맨 위 줄부터 고른다(첫 변경 줄이 보이면 그 줄).
+    fn start_key_selection(&mut self) {
+        let shown: Vec<(usize, usize)> = self.diff_rows.iter().flatten().copied().collect();
+        let Some(&(key, top)) = shown.first() else { return };
+        let rows = &self.rows[&key];
+        let j = shown.iter().map(|&(_, j)| j).find(|&j| rows[j].is_change()).unwrap_or(top);
+        self.sel = Some(Sel { key, anchor: j, head: j });
+        self.send_selection();
+    }
+
+    fn on_select_mouse(&mut self, m: &MouseEvent, pos: Position) -> bool {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) if self.diff_area.contains(pos) => {
+                if let Some((key, j)) = self.row_at(m.row) {
+                    self.sel = Some(Sel { key, anchor: j, head: j });
+                    self.dragging = true;
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                let y = m.row.clamp(self.diff_area.y + 1, (self.diff_area.y + self.diff_area.height).saturating_sub(2));
+                if let (Some((key, j)), Some(s)) = (self.row_at(y), self.sel.as_mut()) {
+                    if s.key == key {
+                        s.head = j;
+                    }
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
+                self.dragging = false;
+                self.send_selection();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 고른 줄을 Claude Code 에 알린다. 줄 번호는 그 수정 직후 파일 기준이다.
+    fn send_selection(&mut self) {
+        let Some(s) = &self.sel else { return };
+        let Some(rows) = self.rows.get(&s.key) else { return };
+        let (a, b) = s.range();
+        let picked: Vec<&Row> = rows[a..=b.min(rows.len() - 1)].iter().filter(|r| r.kind != RowKind::Sep).collect();
+        if picked.is_empty() {
+            return;
+        }
+        let mixed = picked.iter().any(|r| r.kind == RowKind::Del) && picked.iter().any(|r| r.kind != RowKind::Del);
+        let text: Vec<String> = picked
+            .iter()
+            .map(|r| {
+                let t: String = r.spans.iter().map(|(_, t)| t.as_str()).collect();
+                if !mixed {
+                    return t;
+                }
+                let mark = match r.kind {
+                    RowKind::Add => '+',
+                    RowKind::Del => '-',
+                    _ => ' ',
+                };
+                format!("{mark}{t}")
+            })
+            .collect();
+        let nos: Vec<usize> = picked.iter().filter_map(|r| r.new_no).collect();
+        let nos = if nos.is_empty() { picked.iter().filter_map(|r| r.old_no).collect() } else { nos };
+        let (Some(&lo), Some(&hi)) = (nos.iter().min(), nos.iter().max()) else { return };
+        let path = self.entry(s.key).path.clone();
+        if let Some(ide) = &self.ide {
+            ide.select(&path, Some((lo - 1, hi - 1)), &text.join("\n"));
+            self.sent = Some(text.len());
+        }
+    }
+
+    fn clear_selection(&mut self) -> bool {
+        let Some(s) = self.sel.take() else { return false };
+        if let Some(ide) = &self.ide {
+            ide.select(&self.entry(s.key).path, None, "");
+        }
+        self.sent = None;
+        true
+    }
+
+    /// 파일 보기에서 키보드로 고르기: v 로 시작하면 j/k 가 선택 끝을 움직인다.
+    fn move_head(&mut self, delta: isize) {
+        let Some(s) = self.sel.as_mut() else { return };
+        let n = self.rows.get(&s.key).map(|r| r.len()).unwrap_or(0);
+        s.head = (s.head as isize + delta).clamp(0, n as isize - 1) as usize;
+        let head = s.head;
+        if let Some(fv) = self.file.as_mut() {
+            let h = self.diff_area.height.saturating_sub(2) as usize;
+            if head < fv.scroll as usize {
+                fv.scroll = head as u16;
+            } else if head >= fv.scroll as usize + h {
+                fv.scroll = (head + 1 - h) as u16;
+            }
+        }
+        self.send_selection();
+    }
+
     fn on_mouse(&mut self, m: &MouseEvent) {
         let pos = Position::new(m.column, m.row);
+        if self.on_select_mouse(m, pos) {
+            return;
+        }
         if let Some(fv) = &mut self.file {
             if fv.replay.is_none() {
                 match m.kind {
@@ -570,6 +713,7 @@ impl App {
             return false;
         }
         match k.code {
+            KeyCode::Esc if self.clear_selection() => {}
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Enter | KeyCode::Char('o') if self.on_header() => self.toggle_group(),
             KeyCode::Enter | KeyCode::Char('o') => self.open_file(),
@@ -619,7 +763,17 @@ impl App {
     }
 
     fn on_file_key(&mut self, k: KeyEvent, ctrl: bool) {
+        let selecting = self.sel.is_some() && self.file.as_ref().is_some_and(|v| v.replay.is_none());
         match k.code {
+            KeyCode::Esc if self.clear_selection() => return,
+            KeyCode::Char('v') => {
+                if !self.clear_selection() {
+                    self.start_key_selection();
+                }
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down if selecting => return self.move_head(1),
+            KeyCode::Char('k') | KeyCode::Up if selecting => return self.move_head(-1),
             KeyCode::Char('q') | KeyCode::Esc => {
                 let fv = self.file.as_mut().expect("file view");
                 if fv.replay.is_some() {
@@ -778,6 +932,12 @@ fn main() -> Result<()> {
         session_start: 0,
         show_old_wt: false,
         expanded: load_expanded(),
+        sel: None,
+        dragging: false,
+        diff_rows: Vec::new(),
+        ide: None,
+        sent: None,
+        cwd: None,
     };
     app.ingest()?;
     if list_only || args_verify() {
@@ -842,6 +1002,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // 화면을 띄울 때만 연다 — --list·--verify 가 잠금 파일을 남기지 않게.
+    if env::var_os("CCDIFF_NO_IDE").is_none() {
+        app.ide = Ide::start(app.cwd.iter().chain(&app.wt_roots).cloned().collect());
+    }
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableMouseCapture)?;
     let result = run(&mut terminal, &mut app);

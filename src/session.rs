@@ -123,6 +123,13 @@ fn epoch(ts: Option<&str>) -> i64 {
 }
 
 /// 기록 한 줄의 timestamp(유닉스 초). 없으면 0.
+/// 기록 줄의 `cwd`. 이 값을 가진 줄은 많다 — 문자열로만 꺼낸다.
+pub fn line_cwd(line: &str) -> Option<PathBuf> {
+    let key = "\"cwd\":\"";
+    let rest = &line[line.find(key)? + key.len()..];
+    Some(PathBuf::from(&rest[..rest.find('"')?]))
+}
+
 pub fn line_epoch(line: &str) -> i64 {
     let key = "\"timestamp\":\"";
     let Some(i) = line.find(key) else { return 0 };

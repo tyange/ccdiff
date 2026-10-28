@@ -66,6 +66,36 @@ fn row_line(r: &Row, bgs: (Color, Color), reveal: Option<usize>, cursor: bool) -
     Line::from(spans)
 }
 
+/// 고른 줄은 줄 번호 칸을 뒤집어 보인다 — 코드 색과 diff 배경은 그대로 둔다.
+fn mark_selected(mut line: Line<'static>, selected: bool) -> Line<'static> {
+    if selected {
+        if let Some(first) = line.spans.first_mut() {
+            first.style = Style::default().fg(Color::Black).bg(Color::Yellow);
+        }
+    }
+    line
+}
+
+fn is_selected(app: &App, key: usize, j: usize) -> bool {
+    app.sel.as_ref().is_some_and(|s| {
+        let (a, b) = s.range();
+        s.key == key && (a..=b).contains(&j)
+    })
+}
+
+/// 상태줄 앞에 붙는 IDE 연결 표시.
+fn ide_label(app: &App) -> String {
+    let Some(ide) = &app.ide else { return String::new() };
+    let conn = match ide.connected() {
+        0 => format!("IDE :{} 대기", ide.port),
+        n => format!("IDE 연결 {n}"),
+    };
+    match app.sent {
+        Some(n) => format!(" ⧉ {n}줄 → Claude · {conn} ·"),
+        None => format!(" {conn} ·"),
+    }
+}
+
 /// 목록 줄 앞 표시와 제목 꼬리.
 fn commit_mark(app: &App, key: usize) -> (Span<'static>, String) {
     if key >= WT {
@@ -117,6 +147,7 @@ fn truncate_left(s: &str, width: usize) -> String {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
     let theme = app.hl.theme_name();
+    let ide = ide_label(app);
     let text = if app.file.is_some() {
         draw_file(f, app, main);
         let state = match app.file.as_ref().and_then(|v| v.replay.as_ref()) {
@@ -125,13 +156,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             None => "파일 보기",
         };
         format!(
-            " {state} · {theme} │ n/p 다음·이전 수정 · r 처음부터 재생 · space 일시정지 · j/k·PgUp/PgDn 스크롤 · g/G 처음/끝 · Esc 목록 · t 테마 · b 밝기"
+            "{ide} {state} · {theme} │ v 줄 고르기(j/k 늘이기·드래그) · n/p 다음·이전 수정 · r 처음부터 재생 · space 일시정지 · j/k·PgUp/PgDn 스크롤 · g/G 처음/끝 · Esc 목록 · t 테마 · b 밝기"
         )
     } else {
         draw_list(f, app, main);
         let follow = if app.follow { "따라가기 켜짐" } else { "따라가기 꺼짐" };
         format!(
-            " {follow} · {theme} │ Enter 파일 보기·그룹 접기 · z/Z 그룹 접기/전부 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · c 커밋 필터 · a 세션 전 변경 · h git 밖 · t 테마 · b 밝기 · q 종료"
+            "{ide} {follow} · {theme} │ 드래그 줄 고르기 → Claude · Enter 파일 보기·그룹 접기 · z/Z 그룹 접기/전부 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · c 커밋 필터 · a 세션 전 변경 · h git 밖 · t 테마 · b 밝기 · q 종료"
         )
     };
     f.render_widget(Paragraph::new(text).style(gray()), status);
@@ -221,6 +252,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
     let sel = app.selected_entry();
     let title_width = (right.width as usize).saturating_sub(4);
     let mut clamped = None;
+    let mut diff_rows = Vec::new();
     let (title, body) = match sel {
         Some(i) => {
             app.ensure_rows(i);
@@ -243,10 +275,15 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
             let skip = (sc as usize).saturating_sub(body.len());
             body = body.into_iter().skip(sc as usize).collect();
             let room = height.saturating_sub(body.len());
-            body.extend(plan.into_iter().skip(skip).take(room).map(|o| match o {
-                Some(j) => row_line(&rows[j], bgs, None, false),
-                None => sep_line(),
-            }));
+            let mut map: Vec<Option<(usize, usize)>> = vec![None; body.len()];
+            for o in plan.into_iter().skip(skip).take(room) {
+                map.push(o.map(|j| (i, j)));
+                body.push(match o {
+                    Some(j) => mark_selected(row_line(&rows[j], bgs, None, false), is_selected(app, i, j)),
+                    None => sep_line(),
+                });
+            }
+            diff_rows = map;
             if total == 0 {
                 body.push(Line::from("(diff 없음)"));
             }
@@ -268,6 +305,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
     if let Some(sc) = clamped {
         app.scroll = sc;
     }
+    app.diff_rows = diff_rows;
 }
 
 fn draw_file(f: &mut Frame, app: &mut App, area: Rect) {
@@ -343,12 +381,15 @@ fn draw_file(f: &mut Frame, app: &mut App, area: Rect) {
     let (scroll, pos, n) = (fv.scroll, fv.pos, fv.seq.len());
     let rows = &app.rows[&idx];
     let bgs = app.hl.diff_bgs();
-    let lines: Vec<Line> = lines
+    let shown: Vec<&(usize, Option<usize>, bool)> = lines.iter().skip(scroll as usize).take(height).collect();
+    // 재생 중에는 줄이 계속 바뀌어 고를 수 없다.
+    let replaying = app.file.as_ref().is_some_and(|v| v.replay.is_some());
+    let map = shown.iter().map(|&&(i, _, _)| if replaying { None } else { Some((idx, i)) }).collect();
+    let lines: Vec<Line> = shown
         .iter()
-        .skip(scroll as usize)
-        .take(height)
-        .map(|&(i, reveal, cursor)| row_line(&rows[i], bgs, reveal, cursor))
+        .map(|&&(i, reveal, cursor)| mark_selected(row_line(&rows[i], bgs, reveal, cursor), is_selected(app, idx, i)))
         .collect();
+    app.diff_rows = map;
 
     let e = app.entry(idx);
     let title_width = (area.width as usize).saturating_sub(4);
