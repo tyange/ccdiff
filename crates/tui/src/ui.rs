@@ -298,10 +298,10 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
             (format!("{head}{}{tail} ", truncate_left(&e.rel_path(), room)), body)
         }
         None if app.on_header() => (
-            format!(" {} ", app.session),
+            format!(" {} ", app.t.label()),
             vec![Line::from(Span::styled("워크트리 머리줄 — Enter·space·클릭으로 접기/펴기, Z 로 전부", gray()))],
         ),
-        None => (format!(" {} ", app.session), vec![Line::from("아직 수정이 없다")]),
+        None => (format!(" {} ", app.t.label()), vec![Line::from("아직 수정이 없다")]),
     };
     let diff = Paragraph::new(body)
         .block(Block::default().borders(Borders::ALL).title(truncate_left(&title, title_width)))

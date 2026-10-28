@@ -31,7 +31,7 @@ use highlight::Highlighter;
 use ccdiff_core::ide::Ide;
 use replay::{Replay, Step};
 use rows::{apply_highlight, build_rows, Row, RowKind};
-use ccdiff_core::session::{self, bash_roots, parse_entry, EditEntry, Tail};
+use ccdiff_core::{session::EditEntry, tracker::SessionTracker};
 
 /// 작업 트리 항목의 키 시작값. 세션 수정은 0부터, 작업 트리 항목은 WT 부터 센다.
 pub const WT: usize = 1 << 40;
@@ -68,20 +68,10 @@ impl Sel {
 }
 
 pub struct App {
-    pub session: String,
-    /// 읽는 기록들: 처음 연 세션, compact 로 이어진 세션, 그 서브에이전트들.
-    tails: Vec<Tail>,
-    /// 세션 본 기록 사슬(처음 연 것부터). 서브에이전트는 빠진다.
-    chain: Vec<PathBuf>,
-    /// 이미 읽거나 이어짐이 아니라고 본 기록 파일.
-    known: HashSet<PathBuf>,
-    /// 읽은 줄의 uuid — 이어진 세션은 앞 세션 줄을 옮겨 담아 시작하므로 겹치는 줄을 거른다.
-    seen: HashSet<String>,
-    found_at: Option<Instant>,
+    /// 세션 기록 읽기: compact 이어짐·서브에이전트·중복 거르기는 core 가 한다.
+    pub t: SessionTracker,
     /// 상태줄에 잠깐 띄우는 알림.
     pub notice: Option<(String, Instant)>,
-    roots: HashMap<PathBuf, Option<PathBuf>>,
-    pub entries: Vec<EditEntry>,
     repo_order: Vec<Option<PathBuf>>,
     filter: Option<usize>,
     pub list: ListState,
@@ -106,12 +96,8 @@ pub struct App {
     pub commits: HashMap<usize, CommitState>,
     /// 0 전체 · 1 미커밋만 · 2 커밋만
     commit_filter: u8,
-    /// git diff 를 볼 워크트리(세션이 고쳤거나 Bash 로 다룬 곳).
-    wt_roots: Vec<PathBuf>,
     pub wt: Vec<EditEntry>,
     wt_at: Option<Instant>,
-    /// 세션 첫 기록 시각. 그 전부터 있던 작업 트리 변경은 기본으로 숨긴다.
-    session_start: i64,
     pub show_old_wt: bool,
     /// 펼친 워크트리 그룹. 기본은 접힘이고, 펼친 것만 실행 사이에 기억한다.
     expanded: HashSet<Option<PathBuf>>,
@@ -122,8 +108,6 @@ pub struct App {
     pub ide: Option<Ide>,
     /// Claude 에 마지막으로 보낸 선택 줄 수(상태줄 표시용).
     pub sent: Option<usize>,
-    /// 세션이 돈 디렉터리 — Claude 가 IDE 후보를 고를 때 이것을 품는 workspaceFolders 만 보여 준다.
-    cwd: Option<PathBuf>,
 }
 
 fn same_change(a: &EditEntry, b: &EditEntry) -> bool {
@@ -154,74 +138,51 @@ fn load_expanded() -> HashSet<Option<PathBuf>> {
 }
 
 impl App {
+    /// 새 줄을 읽고 반영한다.
     fn ingest(&mut self) -> Result<bool> {
-        let mut changed = false;
-        let mut lines = Vec::new();
-        for (i, t) in self.tails.iter_mut().enumerate() {
-            match t.read_lines() {
-                Ok(l) => lines.extend(l),
-                Err(e) if i == 0 => return Err(e),
-                Err(_) => {}
+        self.t.ingest()?;
+        Ok(self.absorb())
+    }
+
+    /// 새 서브에이전트·이어진 세션 기록을 찾아 읽는다.
+    fn discover(&mut self) {
+        self.t.discover();
+        self.absorb();
+    }
+
+    /// tracker 가 새로 읽은 것을 화면 상태와 IDE 에 반영한다.
+    fn absorb(&mut self) -> bool {
+        let c = self.t.take_changes();
+        if let Some(ide) = self.ide.as_mut() {
+            for p in c.cwds.iter().chain(&c.roots) {
+                ide.add_folder(p);
             }
         }
-        for line in lines {
-            if let Some(u) = session::line_uuid(&line) {
-                if !self.seen.insert(u) {
-                    continue;
+        if !c.roots.is_empty() {
+            self.wt_at = None;
+        }
+        let changed = !c.entries.is_empty();
+        for key in c.entries {
+            let root = self.t.entries[key].root.clone();
+            if !self.repo_order.contains(&root) {
+                self.repo_order.push(root);
+            }
+            if let Some(fv) = &self.file {
+                if self.entry(fv.seq[0]).path == self.t.entries[key].path {
+                    let fv = self.file.as_mut().expect("file view");
+                    let at = if fv.seq.last().is_some_and(|&k| k >= WT) { fv.seq.len() - 1 } else { fv.seq.len() };
+                    fv.seq.insert(at, key);
                 }
             }
-            if self.session_start == 0 {
-                self.session_start = session::line_epoch(&line);
-            }
-            if let Some(cwd) = session::line_cwd(&line) {
-                if let Some(ide) = self.ide.as_mut() {
-                    ide.add_folder(&cwd);
-                }
-                self.cwd.get_or_insert(cwd);
-            }
-            for r in bash_roots(&line, &mut self.roots) {
-                if !self.wt_roots.contains(&r) {
-                    if let Some(ide) = self.ide.as_mut() {
-                        ide.add_folder(&r);
-                    }
-                    self.wt_roots.push(r);
-                    self.wt_at = None;
-                }
-            }
-            if let Some(e) = parse_entry(&line, &mut self.roots) {
-                if let Some(r) = &e.root {
-                    if !self.wt_roots.contains(r) {
-                        if let Some(ide) = self.ide.as_mut() {
-                            ide.add_folder(r);
-                        }
-                        self.wt_roots.push(r.clone());
-                        self.wt_at = None;
-                    }
-                }
-                if !self.repo_order.contains(&e.root) {
-                    self.repo_order.push(e.root.clone());
-                }
-                if let Some(fv) = &self.file {
-                    if self.entry(fv.seq[0]).path == e.path {
-                        let key = self.entries.len();
-                        let fv = self.file.as_mut().expect("file view");
-                        let at = if fv.seq.last().is_some_and(|&k| k >= WT) { fv.seq.len() - 1 } else { fv.seq.len() };
-                        fv.seq.insert(at, key);
-                    }
-                }
-                let late = self.entries.last().is_some_and(|l| l.epoch > e.epoch);
-                self.entries.push(e);
-                // 서브에이전트 기록은 본 기록과 따로 읽혀 시간순이 어긋날 수 있다.
-                if late {
-                    self.sort_file_seq();
-                }
-                changed = true;
+            // 서브에이전트 기록은 본 기록과 따로 읽혀 시간순이 어긋날 수 있다.
+            if key > 0 && self.t.entries[key - 1].epoch > self.t.entries[key].epoch {
+                self.sort_file_seq();
             }
         }
         if changed && self.follow {
             self.select_last();
         }
-        Ok(changed)
+        changed
     }
 
     fn sort_file_seq(&mut self) {
@@ -232,72 +193,8 @@ impl App {
         self.file = Some(fv);
     }
 
-    fn add_tail(&mut self, p: PathBuf) {
-        self.known.insert(p.clone());
-        self.tails.push(Tail::new(p));
-    }
-
-    /// 새로 생긴 서브에이전트 기록과 compact 로 이어진 세션 기록을 찾아 읽기 목록에 넣는다.
-    fn discover(&mut self) -> bool {
-        let before = self.tails.len();
-        let dir = self.chain[0].parent().map(PathBuf::from).unwrap_or_default();
-        // 사슬이 길어지면 새 꼬리가 또 이어질 수 있어 더 찾을 게 없을 때까지 돈다.
-        loop {
-            let mut next = None;
-            for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let p = e.path();
-                if p.extension().is_none_or(|x| x != "jsonl") || self.known.contains(&p) {
-                    continue;
-                }
-                match session::compact_parent(&p) {
-                    Some(u) if self.seen.contains(&u) => {
-                        next = Some(p);
-                        break;
-                    }
-                    Some(_) => {
-                        self.known.insert(p);
-                    }
-                    // 막 생긴 파일은 경계 줄이 아직 안 써졌을 수 있다 — 조금 지난 것만 제외한다.
-                    None => {
-                        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-                        if old.is_some_and(|d| d > Duration::from_secs(30)) {
-                            self.known.insert(p);
-                        }
-                    }
-                }
-            }
-            let Some(p) = next else { break };
-            self.chain.push(p.clone());
-            self.add_tail(p);
-            // 이어진 기록의 줄을 읽어야 그 다음 이어짐의 부모 uuid 를 알 수 있다.
-            let _ = self.ingest();
-        }
-        for s in self.chain.clone() {
-            let dir = s.with_extension("").join("subagents");
-            for e in fs::read_dir(dir).into_iter().flatten().flatten() {
-                let p = e.path();
-                if p.extension().is_some_and(|x| x == "jsonl") && !self.known.contains(&p) {
-                    self.add_tail(p);
-                }
-            }
-        }
-        if self.chain.len() > 1 {
-            let stem = |p: &PathBuf| p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            self.session = format!("{} (compact 로 {}번 이어짐)", stem(self.chain.last().expect("chain")), self.chain.len() - 1);
-        }
-        self.tails.len() > before
-    }
-
-    fn maybe_discover(&mut self) {
-        if self.found_at.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
-            return;
-        }
-        self.found_at = Some(Instant::now());
-        self.discover();
-    }
-
     pub fn entry(&self, key: usize) -> &EditEntry {
-        if key >= WT { &self.wt[key - WT] } else { &self.entries[key] }
+        if key >= WT { &self.wt[key - WT] } else { &self.t.entries[key] }
     }
 
     /// 줄 목록은 바로 만들고 색은 백그라운드에 맡긴다 — 큰 파일에서 방향키가 끊기지 않게.
@@ -344,13 +241,13 @@ impl App {
     }
 
     fn git_req(&self) -> GitReq {
-        let since = self.entries.iter().map(|e| e.epoch).filter(|&t| t > 0).min().unwrap_or(0) - 60;
+        let since = self.t.entries.iter().map(|e| e.epoch).filter(|&t| t > 0).min().unwrap_or(0) - 60;
         // 커밋됨으로 판정된 것은 바뀌지 않으므로 다시 묻지 않는다.
-        let queries = (0..self.entries.len())
+        let queries = (0..self.t.entries.len())
             .filter(|i| !matches!(self.commits.get(i), Some(CommitState::Yes { .. } | CommitState::Changed { .. })))
-            .map(|i| query(i, &self.entries[i]))
+            .map(|i| query(i, &self.t.entries[i]))
             .collect();
-        GitReq { roots: self.wt_roots.clone(), queries, since }
+        GitReq { roots: self.t.wt_roots.clone(), queries, since }
     }
 
     fn request_git(&mut self) {
@@ -414,10 +311,10 @@ impl App {
 
     pub fn visible(&self) -> Vec<usize> {
         let want = self.filter.map(|i| &self.repo_order[i]);
-        let since = if self.show_old_wt { i64::MIN } else { self.session_start - 60 };
+        let since = if self.show_old_wt { i64::MIN } else { self.t.session_start - 60 };
         // 지워진 파일은 mtime 이 없어 0 이다 — 시각으로 거르지 않는다.
         let wt = (0..self.wt.len()).filter(|&j| self.wt[j].epoch == 0 || self.wt[j].epoch >= since).map(|j| WT + j);
-        let mut keys: Vec<usize> = (0..self.entries.len()).chain(wt).collect();
+        let mut keys: Vec<usize> = (0..self.t.entries.len()).chain(wt).collect();
         keys.sort_by_key(|&k| self.entry(k).epoch);
         keys.into_iter()
             .filter(|&i| want.is_none_or(|r| &self.entry(i).root == r))
@@ -435,8 +332,8 @@ impl App {
     }
 
     pub fn uncommitted_count(&self) -> usize {
-        (0..self.entries.len())
-            .filter(|&i| self.entries[i].root.is_some() && matches!(self.commits.get(&i), Some(CommitState::No)))
+        (0..self.t.entries.len())
+            .filter(|&i| self.t.entries[i].root.is_some() && matches!(self.commits.get(&i), Some(CommitState::No)))
             .count()
     }
 
@@ -591,8 +488,8 @@ impl App {
     fn open_file(&mut self) {
         let Some(idx) = self.selected_entry() else { return };
         let path = &self.entry(idx).path;
-        let seq: Vec<usize> = (0..self.entries.len())
-            .filter(|&i| &self.entries[i].path == path)
+        let seq: Vec<usize> = (0..self.t.entries.len())
+            .filter(|&i| &self.t.entries[i].path == path)
             .chain(self.wt.iter().position(|e| &e.path == path).map(|j| WT + j))
             .collect();
         let pos = seq.iter().position(|&i| i == idx).unwrap_or(0);
@@ -997,7 +894,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 }
             }
         }
-        app.maybe_discover();
+        app.t.maybe_discover();
         app.ingest()?;
     }
 }
@@ -1054,18 +951,10 @@ fn main() -> Result<()> {
     let list_only = args.iter().any(|a| a == "--list");
     args.retain(|a| a != "--list");
     let path = resolve_session(args.into_iter().next())?;
-    let session = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
     let mut app = App {
-        session,
-        tails: vec![Tail::new(path.clone())],
-        chain: vec![path.clone()],
-        known: HashSet::from([path]),
-        seen: HashSet::new(),
-        found_at: None,
+        t: SessionTracker::new(path),
         notice: None,
-        roots: HashMap::new(),
-        entries: Vec::new(),
         repo_order: Vec::new(),
         filter: None,
         list: ListState::default(),
@@ -1086,10 +975,8 @@ fn main() -> Result<()> {
         hl_wait: HashSet::new(),
         commits: HashMap::new(),
         commit_filter: 0,
-        wt_roots: Vec::new(),
         wt: Vec::new(),
         wt_at: None,
-        session_start: 0,
         show_old_wt: false,
         expanded: load_expanded(),
         sel: None,
@@ -1097,7 +984,6 @@ fn main() -> Result<()> {
         diff_rows: Vec::new(),
         ide: None,
         sent: None,
-        cwd: None,
     };
     app.ingest()?;
     app.discover();
@@ -1110,9 +996,9 @@ fn main() -> Result<()> {
     // 되살린 "수정 후 파일" 이 같은 파일의 다음 수정의 "수정 전 파일" 과 같은지 본다.
     if args_verify() {
         let (mut ok, mut bad) = (0, 0);
-        for i in 0..app.entries.len() {
-            let Some(j) = (i + 1..app.entries.len()).find(|&j| app.entries[j].path == app.entries[i].path) else { continue };
-            let Some(next_before) = app.entries[j].before.clone() else { continue };
+        for i in 0..app.t.entries.len() {
+            let Some(j) = (i + 1..app.t.entries.len()).find(|&j| app.t.entries[j].path == app.t.entries[i].path) else { continue };
+            let Some(next_before) = app.t.entries[j].before.clone() else { continue };
             app.ensure_rows(i);
             let after: Vec<String> = app.rows[&i]
                 .iter()
@@ -1125,7 +1011,7 @@ fn main() -> Result<()> {
             } else {
                 bad += 1;
                 let at = after.iter().zip(&expect).position(|(a, b)| a != b);
-                println!("불일치: {} {} (줄 {:?}, {}줄 vs {}줄)", app.entries[i].time, app.entries[i].short_path(), at.map(|x| x + 1), after.len(), expect.len());
+                println!("불일치: {} {} (줄 {:?}, {}줄 vs {}줄)", app.t.entries[i].time, app.t.entries[i].short_path(), at.map(|x| x + 1), after.len(), expect.len());
             }
         }
         // 작업 트리 항목: HEAD 에 git diff 를 적용한 결과가 디스크의 지금 파일과 같아야 한다.
@@ -1166,7 +1052,7 @@ fn main() -> Result<()> {
 
     // 화면을 띄울 때만 연다 — --list·--verify 가 잠금 파일을 남기지 않게.
     if env::var_os("CCDIFF_NO_IDE").is_none() {
-        app.ide = Ide::start(app.cwd.iter().chain(&app.wt_roots).cloned().collect());
+        app.ide = Ide::start(app.t.cwd.iter().chain(&app.t.wt_roots).cloned().collect());
     }
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableMouseCapture)?;
