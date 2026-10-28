@@ -8,9 +8,10 @@
 
 use std::{
     io::{self, Read, Write},
+    process::{Child, ChildStdin, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc as std_mpsc,
+        mpsc as std_mpsc, Arc, Mutex,
     },
     thread,
 };
@@ -115,15 +116,71 @@ fn strip_reports(b: &[u8]) -> Vec<u8> {
     out
 }
 
-fn send_keys(tmux: &Tmux, pane: &str, bytes: &[u8]) {
-    let bytes = strip_reports(bytes);
-    if bytes.is_empty() {
-        return;
+/// 다른 세션 window 로 키를 보내는 control mode 클라이언트 하나(서버 전체가 같이 쓴다).
+/// `tmux send-keys` 를 키마다 띄우면 한 번에 70ms 넘게 걸려(실측) 빠르게 치면 밀린다. 이 클라이언트의 표준 입력에
+/// 명령을 쓰면 프로세스를 새로 띄우지 않는다. 아무 window 도 같이 쓰지 않는 전용 세션에 붙어, 크기를 모르는
+/// control 클라이언트가 다른 window 크기를 바꾸지 않게 한다. 서버가 죽으면 표준 입력이 닫혀 함께 끝난다.
+pub struct KeySender {
+    tmux: Tmux,
+    inner: Mutex<Option<(Child, ChildStdin)>>,
+}
+
+impl KeySender {
+    pub fn new(tmux: Tmux) -> Self {
+        Self { tmux, inner: Mutex::new(None) }
     }
-    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let mut args = vec!["send-keys", "-t", pane, "-H"];
-    args.extend(hex.iter().map(String::as_str));
-    tmux.run(&args);
+
+    fn spawn(&self) -> Option<(Child, ChildStdin)> {
+        let name = format!("{VIEW_PREFIX}{}-keys", std::process::id());
+        if !self.tmux.has_session(&name) {
+            self.tmux.run(&["new-session", "-d", "-s", &name])?;
+        }
+        let mut child = self
+            .tmux
+            .command()
+            .args(["-C", "attach-session", "-t", &format!("={name}"), "-f", "no-output"])
+            .env_remove("TMUX")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        // 붙은 뒤에 켠다 — 서버가 죽어 클라이언트가 떨어지면 세션도 사라진다.
+        writeln!(stdin, "set-option -t {name} destroy-unattached on").ok()?;
+        Some((child, stdin))
+    }
+
+    /// 실패하면(클라이언트가 죽었으면) 한 번 다시 띄워 본다.
+    pub fn send(&self, pane: &str, bytes: &[u8]) {
+        let bytes = strip_reports(bytes);
+        if bytes.is_empty() {
+            return;
+        }
+        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let line = format!("send-keys -t {pane} -H {}\n", hex.join(" "));
+        let Ok(mut inner) = self.inner.lock() else { return };
+        for _ in 0..2 {
+            if inner.as_mut().is_some_and(|(c, _)| c.try_wait().ok().flatten().is_none()) {
+                let (_, stdin) = inner.as_mut().expect("checked");
+                if stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()).is_ok() {
+                    return;
+                }
+            }
+            *inner = self.spawn();
+        }
+    }
+}
+
+impl Drop for KeySender {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some((mut child, stdin)) = inner.take() {
+                drop(stdin);
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
 pub async fn handle(
@@ -138,10 +195,10 @@ pub async fn handle(
         return (StatusCode::NOT_FOUND, "목록에 없는 pane").into_response();
     }
     let (cols, rows) = size(q.as_deref());
-    ws.protocols([WS_PROTOCOL]).on_upgrade(move |s| serve(s, st.tmux.clone(), pane, cols, rows))
+    ws.protocols([WS_PROTOCOL]).on_upgrade(move |s| serve(s, st.tmux.clone(), st.keys.clone(), pane, cols, rows))
 }
 
-async fn serve(mut ws: WebSocket, tmux: Tmux, pane: String, cols: u16, rows: u16) {
+async fn serve(mut ws: WebSocket, tmux: Tmux, keys: Arc<KeySender>, pane: String, cols: u16, rows: u16) {
     let t = tmux.clone();
     let term = match tokio::task::spawn_blocking(move || open(&t, &pane, cols, rows)).await {
         Ok(Ok(term)) => term,
@@ -170,17 +227,18 @@ async fn serve(mut ws: WebSocket, tmux: Tmux, pane: String, cols: u16, rows: u16
     });
     let (in_tx, in_rx) = std_mpsc::channel::<Vec<u8>>();
     let (owned, pane) = (term.owned, term.pane.clone());
-    let keys_tmux = tmux.clone();
     thread::spawn(move || {
-        for b in in_rx {
-            let ok = if owned {
-                writer.write_all(&b).is_ok()
+        while let Ok(mut b) = in_rx.recv() {
+            // 쌓인 입력은 한 번에 보낸다.
+            while let Ok(more) = in_rx.try_recv() {
+                b.extend(more);
+            }
+            if owned {
+                if writer.write_all(&b).is_err() {
+                    return;
+                }
             } else {
-                send_keys(&keys_tmux, &pane, &b);
-                true
-            };
-            if !ok {
-                return;
+                keys.send(&pane, &b);
             }
         }
     });

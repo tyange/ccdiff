@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 
 import { subscribe, type Conn } from "./api";
+import { ImportDialog, NewSessionDialog } from "./Dialogs";
 import { SessionList } from "./SessionList";
+import { Terminal, type TerminalHandle } from "./Terminal";
 import type { Session } from "./types";
 
 type Panel = "sessions" | "terminal" | "changes" | "servers";
@@ -32,6 +34,11 @@ export function App() {
   const [focused, setFocused] = useState<Panel | null>(null);
   const [now, setNow] = useState(() => Date.now() / 1000);
   const panels = useRef<Record<Panel, HTMLElement | null>>({ sessions: null, terminal: null, changes: null, servers: null });
+  const terminal = useRef<TerminalHandle>(null);
+  const [importing, setImporting] = useState<Session | null>(null);
+  const [starting, setStarting] = useState(false);
+  // 새로 띄운 pane — 목록에 나타나면 고른다(Claude 가 세션 파일을 쓰기까지 몇 초 걸린다).
+  const [pendingPane, setPendingPane] = useState<string | null>(null);
 
   useEffect(
     () =>
@@ -56,7 +63,18 @@ export function App() {
     } catch {
       // 저장 못 해도 고르기는 된다.
     }
+    // 고르고 바로 입력할 수 있게 터미널로.
+    terminal.current?.focus();
   };
+
+  useEffect(() => {
+    if (!pendingPane) return;
+    const s = sessions.find((x) => x.pane.id === pendingPane);
+    if (s) {
+      setPendingPane(null);
+      select(s.key);
+    }
+  }, [sessions, pendingPane]);
 
   // 앱 단축키는 ⌘ 계열만. 캡처 단계에서 먼저 받아 터미널로 넘기지 않는다.
   const latest = useRef({ sessions, focused, select });
@@ -125,6 +143,8 @@ export function App() {
             {w && ` · ${w.name} · ${w.branch}`}
           </span>
         )}
+        {pendingPane && <span>새 세션 기다리는 중…</span>}
+        <button onClick={() => setStarting(true)}>새 세션…</button>
         <span className="hint">⌘1–9 세션 · ⌘J 변경 칸</span>
       </div>
       {panel(
@@ -132,9 +152,29 @@ export function App() {
         `세션 ${sessions.length}`,
         <SessionList sessions={sessions} selected={current?.key ?? null} onSelect={select} now={now} />,
       )}
-      {panel("terminal", "터미널", <p className="empty">다음 단계: 이 세션의 tmux pane 에 붙는다</p>)}
+      {panel("terminal", "터미널", <Terminal ref={terminal} session={current} onImport={setImporting} />)}
       {panel("changes", "변경", <p className="empty">다음 단계: ccdiff 코어의 파일 목록과 diff</p>)}
       {panel("servers", "서버", <p className="empty">다음 단계: dev 서버 로그</p>)}
+      {importing && (
+        <ImportDialog
+          session={importing}
+          onClose={() => setImporting(null)}
+          onDone={() => {
+            setImporting(null);
+            terminal.current?.focus();
+          }}
+        />
+      )}
+      {starting && (
+        <NewSessionDialog
+          sessions={sessions}
+          onClose={() => setStarting(false)}
+          onStarted={(pane) => {
+            setStarting(false);
+            setPendingPane(pane);
+          }}
+        />
+      )}
     </div>
   );
 }

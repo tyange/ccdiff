@@ -26,6 +26,24 @@ export async function getJson<T>(path: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+/** 실패하면 서버가 준 이유(error)로 던진다. */
+export async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j as { error?: string }).error ?? `${path} ${r.status}`);
+  return j as T;
+}
+
+/** 서버 WebSocket 주소와 하위 프로토콜(토큰 포함). */
+export function wsArgs(path: string): [string, string[]] {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  return [`${scheme}://${location.host}${path}`, ["worktable.v1", `auth.${token}`]];
+}
+
 export type Conn = "connecting" | "open" | "closed" | "no-token";
 
 /** /ws/events 에 붙고, 끊기면 1초 → 최대 10초 간격으로 다시 붙는다. 돌려준 함수로 끊는다. */
@@ -40,10 +58,7 @@ export function subscribe(onEvent: (e: ServerEvent) => void, onConn: (c: Conn) =
   let timer: number | undefined;
   const open = () => {
     onConn("connecting");
-    ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/events`, [
-      "worktable.v1",
-      `auth.${token}`,
-    ]);
+    ws = new WebSocket(...wsArgs("/ws/events"));
     ws.onopen = () => {
       delay = 1000;
       onConn("open");

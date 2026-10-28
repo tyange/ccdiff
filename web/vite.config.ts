@@ -16,5 +16,6 @@ export default defineConfig({
       "/ws": { target, changeOrigin: true, ws: true, headers: { Origin: target } },
     },
   },
-  build: { outDir: "dist", emptyOutDir: true },
+  // 로컬에서만 쓰는 앱이라 번들 크기 경고 한도를 올린다(Monaco 가 들어오면 수 MB).
+  build: { outDir: "dist", emptyOutDir: true, chunkSizeWarningLimit: 8000 },
 });

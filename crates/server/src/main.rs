@@ -92,6 +92,7 @@ pub struct AppState {
     sessions: watch::Receiver<Value>,
     tmux: Tmux,
     plans: Arc<actions::Plans>,
+    keys: Arc<term::KeySender>,
 }
 
 /// 막히는 tmux·git 호출을 돌리고 결과를 JSON 으로. 실패는 409 와 이유.
@@ -274,7 +275,12 @@ async fn main() -> Result<()> {
         .route("/ws/events", get(events))
         .route("/ws/term/{pane}", get(term::handle))
         .fallback(static_file)
-        .with_state(AppState { sessions: spawn_refresh(tmux.clone()), tmux, plans: Arc::default() })
+        .with_state(AppState {
+            sessions: spawn_refresh(tmux.clone()),
+            keys: Arc::new(term::KeySender::new(tmux.clone())),
+            tmux,
+            plans: Arc::default(),
+        })
         .layer(middleware::from_fn_with_state(guard, guard::layer));
 
     let url = format!("http://127.0.0.1:{port}/#t={token}");
