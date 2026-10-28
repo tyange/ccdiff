@@ -1,7 +1,8 @@
 //! 날짜별 투두 파일. 사람(wtcode)과 에이전트(Claude)가 같은 마크다운 파일을 고친다.
 //! 위치: WTCODE_TODO_DIR, 없으면 $XDG_DATA_HOME/wtcode/todo, 없으면 ~/.local/share/wtcode/todo — `YYYY-MM-DD.md`.
-//! 형식: `# 작업 현황·투두 — 날짜`, `## 끝난 것`, `## 진행 중`(| 이슈 | 상태 | 다음 | 표), `## 투두`(- [ ] / - [x]), `## 메모`.
-//! 오늘 파일이 없으면 가장 최근 파일에서 진행 중 표와 끝나지 않은 투두만 옮겨 만든다.
+//! 형식: `# 투두 — 날짜`, `## 투두`(- [ ] / - [x]), `## 특이사항`(불릿). 투두 항목은 `#이슈 제목 — 세부` 꼴이면
+//! 화면에서 이슈 배지·제목·흐린 세부 줄로 나뉘어 보인다.
+//! 오늘 파일이 없으면 가장 최근 파일에서 끝나지 않은 투두만 옮겨 만든다(특이사항은 그날 것이라 옮기지 않는다).
 //! 고칠 때는 파일을 다시 읽고 그 줄이 화면에 보인 것과 같을 때만 바꾼다 — 에이전트가 그 사이 고쳤을 수 있다.
 
 use std::{
@@ -10,7 +11,8 @@ use std::{
 };
 
 pub const TODO_HEADING: &str = "## 투두";
-const DOING_HEADING: &str = "## 진행 중";
+/// 투두 아래 특이사항. 예전 형식의 `## 메모` 도 같은 섹션으로 읽는다.
+pub const NOTES_HEADINGS: &[&str] = &["## 특이사항", "## 메모"];
 
 pub fn dir() -> PathBuf {
     if let Some(d) = env::var_os("WTCODE_TODO_DIR").filter(|v| !v.is_empty()) {
@@ -27,27 +29,18 @@ pub fn today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-fn skeleton(date: &str, doing: &[String], todos: &[String]) -> String {
-    let mut s = format!("# 작업 현황·투두 — {date}\n\n## 끝난 것\n\n{DOING_HEADING}\n\n");
-    if doing.is_empty() {
-        s += "| 이슈 | 상태 | 다음 |\n|---|---|---|\n";
-    } else {
-        for l in doing {
-            s += l;
-            s += "\n";
-        }
-    }
-    s += &format!("\n{TODO_HEADING}\n\n");
+fn skeleton(date: &str, todos: &[String]) -> String {
+    let mut s = format!("# 투두 — {date}\n\n{TODO_HEADING}\n\n");
     for l in todos {
         s += l;
         s += "\n";
     }
-    s += "\n## 메모\n";
+    s += &format!("\n{}\n", NOTES_HEADINGS[0]);
     s
 }
 
 /// 한 섹션(`## 이름` 다음부터 다음 `## ` 앞까지)의 줄들.
-fn section<'a>(content: &'a str, heading: &str) -> Vec<&'a str> {
+pub fn section<'a>(content: &'a str, heading: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut inside = false;
     for l in content.lines() {
@@ -62,7 +55,7 @@ fn section<'a>(content: &'a str, heading: &str) -> Vec<&'a str> {
     out
 }
 
-/// 오늘 파일 경로. 없으면 가장 최근 파일에서 진행 중 표와 끝나지 않은 투두를 옮겨 만든다.
+/// 오늘 파일 경로. 없으면 가장 최근 파일에서 끝나지 않은 투두를 옮겨 만든다.
 pub fn ensure_today() -> io::Result<PathBuf> {
     let d = dir();
     fs::create_dir_all(&d)?;
@@ -77,14 +70,11 @@ pub fn ensure_today() -> io::Result<PathBuf> {
         .filter(|p| p.extension().is_some_and(|x| x == "md") && p.file_stem().is_some_and(|s| s.to_string_lossy().as_ref() < date.as_str()))
         .collect();
     prev.sort();
-    let (doing, todos) = match prev.last().and_then(|p| fs::read_to_string(p).ok()) {
-        Some(c) => (
-            section(&c, DOING_HEADING).into_iter().filter(|l| l.trim_start().starts_with('|')).map(String::from).collect(),
-            section(&c, TODO_HEADING).into_iter().filter(|l| task(l) == Some(false)).map(String::from).collect(),
-        ),
-        None => (Vec::new(), Vec::new()),
+    let todos: Vec<String> = match prev.last().and_then(|p| fs::read_to_string(p).ok()) {
+        Some(c) => section(&c, TODO_HEADING).into_iter().filter(|l| task(l) == Some(false)).map(String::from).collect(),
+        None => Vec::new(),
     };
-    write(&path, &skeleton(&date, &doing, &todos))?;
+    write(&path, &skeleton(&date, &todos))?;
     Ok(path)
 }
 
@@ -206,16 +196,10 @@ mod tests {
     }
 
     #[test]
-    fn rolls_over_doing_and_open_todos() {
-        let prev = "# 작업 현황·투두 — 2000-01-01\n\n## 끝난 것\n- 끝\n\n## 진행 중\n\n| 이슈 | 상태 | 다음 |\n|---|---|---|\n| GH-1 | 리뷰 | 머지 |\n\n## 투두\n\n- [x] 했다\n- [ ] 남았다\n\n## 메모\n- 메모\n";
-        let s = section(prev, DOING_HEADING);
-        assert!(s.contains(&"| GH-1 | 리뷰 | 머지 |"));
-        let doing: Vec<String> = s.into_iter().filter(|l| l.trim_start().starts_with('|')).map(String::from).collect();
+    fn rolls_over_open_todos_only() {
+        let prev = "# 투두 — 2000-01-01\n\n## 투두\n\n- [x] 했다\n- [ ] 남았다\n\n## 특이사항\n- 그날 일\n";
         let todos: Vec<String> = section(prev, TODO_HEADING).into_iter().filter(|l| task(l) == Some(false)).map(String::from).collect();
-        let out = skeleton("2000-01-02", &doing, &todos);
-        assert!(out.contains("| GH-1 | 리뷰 | 머지 |"));
-        assert!(out.contains("- [ ] 남았다"));
-        assert!(!out.contains("했다"));
-        assert!(!out.contains("- 끝"));
+        let out = skeleton("2000-01-02", &todos);
+        assert_eq!(out, "# 투두 — 2000-01-02\n\n## 투두\n\n- [ ] 남았다\n\n## 특이사항\n");
     }
 }

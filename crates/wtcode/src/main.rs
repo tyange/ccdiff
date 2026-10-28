@@ -138,8 +138,9 @@ struct Todo {
 }
 
 impl Todo {
+    /// 화면 순서의 투두 줄 번호(남은 것 다음 완료한 것).
     fn tasks(&self) -> Vec<usize> {
-        (0..self.lines.len()).filter(|&i| todo::task(&self.lines[i]).is_some()).collect()
+        render::display_order(&self.lines)
     }
 
     /// 파일이 바뀌었으면 다시 읽는다. 고른 줄은 같은 내용의 줄로 옮긴다.
@@ -149,12 +150,14 @@ impl Todo {
             return;
         }
         let keep = self.sel.and_then(|i| self.lines.get(i).cloned());
+        let pos = self.sel.and_then(|s| self.tasks().iter().position(|&i| i == s));
         self.lines = fs::read_to_string(&self.path).unwrap_or_default().lines().map(String::from).collect();
         self.mtime = m;
         let tasks = self.tasks();
+        // 같은 줄이 있으면 그 줄, 없으면(체크해서 완료로 내려갔거나 지워졌으면) 같은 화면 위치 — 연달아 체크하기 좋게.
         self.sel = keep
             .and_then(|k| tasks.iter().copied().find(|&i| self.lines[i] == k))
-            .or_else(|| self.sel.and_then(|s| tasks.iter().copied().find(|&i| i >= s)))
+            .or_else(|| pos.and_then(|p| tasks.get(p.min(tasks.len().saturating_sub(1))).copied()))
             .or_else(|| tasks.first().copied());
     }
 
@@ -453,8 +456,8 @@ impl App {
                 self.todo.sel = Some(at);
                 // 그 항목의 첫 화면 줄에서 체크박스(줄 앞 몇 칸)를 누르면 바로 체크한다.
                 let first = r == 0 || self.todo.rows_src[r - 1] != Some(at);
-                let indent = self.todo.lines[at].len() - self.todo.lines[at].trim_start().len();
-                if first && (col - t.x) as usize <= indent + 3 {
+                let inner = col.saturating_sub(t.x + 1) as usize;
+                if first && inner <= render::MARK_COL + 1 {
                     self.toggle_todo();
                 }
             }
@@ -503,12 +506,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_todo(f: &mut Frame, app: &mut App, area: Rect) {
     let t = &mut app.todo;
     let focused = app.focus == Focus::Todo;
-    let mut rows = render::render(&t.lines, area.width.saturating_sub(2) as usize);
-    if focused {
-        for r in rows.iter_mut().filter(|r| r.src.is_some() && r.src == t.sel) {
-            r.line = std::mem::take(&mut r.line).style(Style::default().add_modifier(Modifier::REVERSED));
-        }
-    }
+    let rows = render::render(&t.lines, area.width.saturating_sub(2) as usize, t.sel.filter(|_| focused));
     // 고른 항목의 화면 줄이 모두 보이게 스크롤한다.
     let h = area.height.saturating_sub(2) as usize;
     let span = t.sel.map(|s| {
