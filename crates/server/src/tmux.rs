@@ -1,6 +1,6 @@
-//! tmux 읽기. WORKTABLE_TMUX_SOCKET 이 있으면 `tmux -L <이름>` 으로 그 서버만 본다(테스트용).
+//! tmux 읽기와 조작. WORKTABLE_TMUX_SOCKET 이 있으면 `tmux -L <이름>` 으로 그 서버만 본다(테스트용).
 
-use std::{env, path::PathBuf, process::Command};
+use std::{collections::HashSet, env, path::PathBuf, process::Command};
 
 #[derive(Clone, Debug)]
 pub struct Pane {
@@ -59,11 +59,51 @@ impl Tmux {
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// 모든 pane. 웹 칸이 붙으려고 만든 보기용 세션은 원래 세션과 window 를 같이 쓰므로 빼고, pane 은 한 번씩만.
     pub fn panes(&self) -> Vec<Pane> {
         let fmt = FIELDS.iter().map(|f| format!("#{{{f}}}")).collect::<Vec<_>>().join("\t");
         let Some(raw) = self.run(&["list-panes", "-a", "-F", &fmt]) else { return Vec::new() };
-        raw.lines().filter_map(parse_pane).collect()
+        let mut seen = HashSet::new();
+        raw.lines()
+            .filter_map(parse_pane)
+            .filter(|p| !is_view_session(&p.session) && seen.insert(p.id.clone()))
+            .collect()
     }
+
+    pub fn pane(&self, id: &str) -> Option<Pane> {
+        self.panes().into_iter().find(|p| p.id == id)
+    }
+
+    pub fn has_session(&self, name: &str) -> bool {
+        self.run(&["has-session", "-t", &format!("={name}")]).is_some()
+    }
+
+    /// window 안 pane 수.
+    pub fn window_panes(&self, window_id: &str) -> usize {
+        self.run(&["list-panes", "-t", window_id, "-F", "#{pane_id}"]).map(|s| s.lines().count()).unwrap_or(0)
+    }
+
+    /// 붙은 클라이언트가 없는 보기용 세션을 치운다(앞서 죽은 서버가 남긴 것).
+    pub fn sweep_views(&self) {
+        let Some(raw) = self.run(&["list-sessions", "-F", "#{session_name}\t#{session_attached}"]) else { return };
+        for line in raw.lines() {
+            if let Some((name, "0")) = line.split_once('\t') {
+                if is_view_session(name) {
+                    self.run(&["kill-session", "-t", &format!("={name}")]);
+                }
+            }
+        }
+    }
+}
+
+/// 웹 터미널 칸이 붙으려고 만든 보기용 세션 이름의 머리.
+pub const VIEW_PREFIX: &str = "wt-view-";
+
+/// 앱이 가져온·새로 띄운 Claude 를 두는 세션.
+pub const HOME_SESSION: &str = "worktable";
+
+pub fn is_view_session(name: &str) -> bool {
+    name.starts_with(VIEW_PREFIX)
 }
 
 fn parse_pane(line: &str) -> Option<Pane> {

@@ -1,14 +1,17 @@
 //! worktable: Claude Code 세션·워크트리·dev 서버를 한 화면에서 다루는 로컬 웹 앱의 서버.
 //! 브라우저는 화면만 그린다. 파일·터미널·git·프로세스는 모두 이 서버가 맡는다.
 
+mod actions;
 mod claude;
 mod discover;
 mod guard;
 mod procs;
+mod pty;
 mod registry;
+mod term;
 mod tmux;
 
-use std::{env, fs, process::Command, thread, time::Duration};
+use std::{env, fs, process::Command, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -19,7 +22,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde_json::{json, Value};
@@ -85,8 +88,46 @@ async fn health() -> Json<serde_json::Value> {
 
 /// 갱신 스레드가 내보내는 화면 상태.
 #[derive(Clone)]
-struct AppState {
+pub struct AppState {
     sessions: watch::Receiver<Value>,
+    tmux: Tmux,
+    plans: Arc<actions::Plans>,
+}
+
+/// 막히는 tmux·git 호출을 돌리고 결과를 JSON 으로. 실패는 409 와 이유.
+async fn blocking(f: impl FnOnce() -> Result<Value, String> + Send + 'static) -> Response {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => (StatusCode::CONFLICT, Json(json!({"error": e}))).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn field(body: &Value, key: &str) -> String {
+    body[key].as_str().unwrap_or_default().to_string()
+}
+
+/// 가져오기 계획: {"pane": "%1"} → 경고와 nonce.
+async fn import_plan(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    let pane = field(&body, "pane");
+    blocking(move || actions::plan_import(&st.tmux, &st.plans, &pane)).await
+}
+
+/// 확인한 계획 실행: {"nonce": "..."}.
+async fn import(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    let nonce = field(&body, "nonce");
+    blocking(move || actions::import(&st.tmux, &st.plans, &nonce)).await
+}
+
+async fn worktrees(State(st): State<AppState>) -> Response {
+    let sessions = st.sessions.borrow().clone();
+    blocking(move || Ok(Value::Array(actions::worktrees(&sessions)))).await
+}
+
+/// 새 세션: {"path": "<워크트리>"}.
+async fn new_session(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    let (path, sessions) = (field(&body, "path"), st.sessions.borrow().clone());
+    blocking(move || actions::new_session(&st.tmux, &sessions, &path)).await
 }
 
 async fn sessions(State(st): State<AppState>) -> Json<Value> {
@@ -219,13 +260,21 @@ async fn main() -> Result<()> {
     let port = listener.local_addr()?.port();
     let token = random_token().context("/dev/urandom 을 읽지 못해 토큰을 만들 수 없다")?;
     let guard = Guard::new(port, token.clone());
+    let tmux = Tmux::from_env();
+    // 앞서 죽은 서버가 남긴 보기용 세션을 치운다.
+    tmux.sweep_views();
 
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sessions", get(sessions))
+        .route("/api/import/plan", post(import_plan))
+        .route("/api/import", post(import))
+        .route("/api/worktrees", get(worktrees))
+        .route("/api/sessions/new", post(new_session))
         .route("/ws/events", get(events))
+        .route("/ws/term/{pane}", get(term::handle))
         .fallback(static_file)
-        .with_state(AppState { sessions: spawn_refresh(Tmux::from_env()) })
+        .with_state(AppState { sessions: spawn_refresh(tmux.clone()), tmux, plans: Arc::default() })
         .layer(middleware::from_fn_with_state(guard, guard::layer));
 
     let url = format!("http://127.0.0.1:{port}/#t={token}");
