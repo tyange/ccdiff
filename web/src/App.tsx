@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { subscribe, type Conn } from "./api";
 import { Changes, type ChangesHandle } from "./Changes";
 import { ImportDialog, NewSessionDialog } from "./Dialogs";
+import { Palette, type Command } from "./Palette";
 import { Servers } from "./Servers";
 import { SessionList } from "./SessionList";
 import { Terminal, type TerminalHandle } from "./Terminal";
@@ -40,6 +41,7 @@ export function App() {
   const changes = useRef<ChangesHandle>(null);
   const [importing, setImporting] = useState<Session | null>(null);
   const [starting, setStarting] = useState(false);
+  const [palette, setPalette] = useState(false);
   // 새로 띄운 pane — 목록에 나타나면 고른다(Claude 가 세션 파일을 쓰기까지 몇 초 걸린다).
   const [pendingPane, setPendingPane] = useState<string | null>(null);
 
@@ -94,6 +96,8 @@ export function App() {
         // 변경 칸으로 갔다가, 다시 누르면 터미널로 돌아온다.
         if (focused === "changes") terminal.current?.focus();
         else panels.current.changes?.focus();
+      } else if (e.code === "KeyK") {
+        setPalette((open) => !open);
       } else if (e.code === "KeyE") {
         changes.current?.openInEditor();
       } else if (e.code === "ArrowUp" || e.code === "ArrowDown") {
@@ -144,6 +148,25 @@ export function App() {
     </section>
   );
 
+  const sessionLabel = (s: Session) => (s.worktree?.issue ? `gh${s.worktree.issue}` : s.pane.agent || s.worktree?.name || s.pane.windowName);
+  const commands: Command[] = [
+    ...sessions.map((s, i) => ({
+      id: `s:${s.key}`,
+      label: `세션 ${sessionLabel(s)}`,
+      detail: [s.worktree?.branch, s.pane.windowName, s.pane.agent].filter(Boolean).join(" · "),
+      keys: i < 9 ? `⌘${i + 1}` : undefined,
+      run: () => select(s.key),
+    })),
+    { id: "new", label: "새 세션 시작…", run: () => setStarting(true) },
+    ...(current && current.pane.session !== "worktable"
+      ? [{ id: "import", label: `worktable 로 가져오기… (${sessionLabel(current)})`, run: () => setImporting(current) }]
+      : []),
+    { id: "terminal", label: "터미널로", run: () => terminal.current?.focus() },
+    { id: "changes", label: "변경 칸으로", keys: "⌘J", run: () => panels.current.changes?.focus() },
+    { id: "servers", label: "서버 칸으로", run: () => panels.current.servers?.focus() },
+    { id: "editor", label: "편집기에서 열기", keys: "⌘E", run: () => changes.current?.openInEditor() },
+  ];
+
   const w = current?.worktree;
   return (
     <div className="app">
@@ -157,7 +180,7 @@ export function App() {
         )}
         {pendingPane && <span>새 세션 기다리는 중…</span>}
         <button onClick={() => setStarting(true)}>새 세션…</button>
-        <span className="hint">⌘1–9 세션 · ⌘J 변경 칸 · ⌘↑↓ 파일 · ⌘⇧↑↓ 수정 · ⌘E 편집기</span>
+        <span className="hint">⌘K 명령 · ⌘1–9 세션 · ⌘J 변경 칸 · ⌘↑↓ 파일 · ⌘⇧↑↓ 수정 · ⌘E 편집기</span>
       </div>
       {panel(
         "sessions",
@@ -181,6 +204,7 @@ export function App() {
           }}
         />
       )}
+      {palette && <Palette commands={commands} onClose={() => setPalette(false)} />}
       {starting && (
         <NewSessionDialog
           sessions={sessions}

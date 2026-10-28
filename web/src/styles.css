@@ -220,3 +220,12 @@ button.link { border: none; background: none; color: var(--accent); padding: 0 4
 .srv-head .spacer { flex: 1; }
 .log { flex: 1; min-height: 0; margin: 0; padding: 4px 8px; overflow: auto; font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
 .srv-detail .notice { position: absolute; right: 8px; bottom: 6px; background: var(--panel); color: var(--accent); padding: 2px 6px; border: 1px solid var(--line); border-radius: 4px; font-size: 12px; }
+
+.palette-back { place-items: start center; padding-top: 12vh; }
+.palette { width: min(560px, calc(100vw - 32px)); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; box-shadow: 0 8px 24px rgb(0 0 0 / 0.25); }
+.palette input { width: 100%; font: inherit; font-size: 14px; padding: 10px 12px; border: none; border-bottom: 1px solid var(--line); background: var(--bg); color: var(--fg); outline: none; }
+.palette ul { list-style: none; margin: 0; padding: 4px 0; max-height: 50vh; overflow: auto; }
+.palette li { display: flex; gap: 10px; align-items: baseline; padding: 5px 12px; cursor: pointer; }
+.palette li.active { background: var(--sel); }
+.palette li kbd { margin-left: auto; }
+.palette li .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
