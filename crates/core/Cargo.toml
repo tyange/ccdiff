@@ -1,0 +1,11 @@
+[package]
+name = "ccdiff-core"
+version = "0.1.0"
+edition = "2021"
+description = "Claude Code 세션 기록에서 파일 수정·커밋 여부·작업 트리 변경을 읽는 코어"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+serde_json = "1"
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }

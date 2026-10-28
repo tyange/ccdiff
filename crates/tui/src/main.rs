@@ -1,12 +1,8 @@
 mod bg;
-mod git;
 mod highlight;
-mod ide;
 mod replay;
 mod rows;
-mod session;
 mod ui;
-mod worktree;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -30,12 +26,12 @@ use ratatui::{
 };
 
 use bg::{run_git, GitDone, GitReq, GitWorker, HlJob, HlWorker};
-use git::{query, CommitState, GitIndex};
+use ccdiff_core::git::{query, CommitState, GitIndex};
 use highlight::Highlighter;
-use ide::Ide;
+use ccdiff_core::ide::Ide;
 use replay::{Replay, Step};
 use rows::{apply_highlight, build_rows, Row, RowKind};
-use session::{bash_roots, parse_entry, EditEntry, Tail};
+use ccdiff_core::session::{self, bash_roots, parse_entry, EditEntry, Tail};
 
 /// 작업 트리 항목의 키 시작값. 세션 수정은 0부터, 작업 트리 항목은 WT 부터 센다.
 pub const WT: usize = 1 << 40;

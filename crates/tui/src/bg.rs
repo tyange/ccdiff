@@ -11,12 +11,13 @@ use std::{
     thread,
 };
 
-use crate::{
+use ccdiff_core::{
     git::{CommitQuery, CommitState, GitIndex},
-    highlight::{Highlighter, Spans},
     session::EditEntry,
     worktree,
 };
+
+use crate::highlight::{Highlighter, Spans};
 
 pub struct HlJob {
     pub key: usize,

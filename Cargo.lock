@@ -131,12 +131,21 @@ name = "ccdiff"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ccdiff-core",
  "chrono",
  "ratatui",
- "serde_json",
  "syntect",
- "tungstenite",
  "two-face",
+]
+
+[[package]]
+name = "ccdiff-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "tungstenite",
 ]
 
 [[package]]

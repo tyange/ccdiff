@@ -6,8 +6,9 @@ use ratatui::{
     Frame,
 };
 
+use ccdiff_core::git::CommitState;
+
 use crate::{
-    git::CommitState,
     replay::Phase,
     rows::{compact, Row, RowKind},
     App, Disp, WT,
@@ -123,7 +124,7 @@ fn commit_mark(app: &App, key: usize) -> (Span<'static>, String) {
 }
 
 /// 목록에 이름이 겹치는 파일이 있으면 상위 폴더까지 붙인다(`ko/lang.json`).
-fn display_name(e: &crate::session::EditEntry, count: &std::collections::HashMap<String, usize>) -> String {
+fn display_name(e: &ccdiff_core::session::EditEntry, count: &std::collections::HashMap<String, usize>) -> String {
     let name = e.file_name();
     if count.get(&name).copied().unwrap_or(0) < 2 {
         return name;
