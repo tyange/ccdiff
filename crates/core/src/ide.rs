@@ -82,8 +82,16 @@ fn remove_stale(dir: &Path, name: &str) {
 impl Ide {
     /// 실패하면 None — 연동만 안 될 뿐 쓰는 쪽은 그대로 돈다.
     /// CCDIFF_IDE_LOG 에 파일 경로가 있으면 Claude 가 보낸 메시지를 그대로 덧붙여 남긴다(규약 실측용).
-    pub fn start(name: &str, mut folders: Vec<PathBuf>) -> Option<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    pub fn start(name: &str, folders: Vec<PathBuf>) -> Option<Self> {
+        Self::start_on(name, folders, None)
+    }
+
+    /// port 를 먼저 시도하고, 쓰고 있으면 아무 포트나 연다. CLAUDE_CODE_SSE_PORT 로 띄운 Claude 는 그 포트에만
+    /// 붙으므로, 다시 시작해도 같은 포트를 쓰면 이미 떠 있는 Claude 가 다시 붙을 수 있다.
+    pub fn start_on(name: &str, mut folders: Vec<PathBuf>, port: Option<u16>) -> Option<Self> {
+        let listener = port
+            .and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok())
+            .or_else(|| TcpListener::bind("127.0.0.1:0").ok())?;
         let port = listener.local_addr().ok()?.port();
         let token = random_token()?;
         let dir = PathBuf::from(env::var_os("HOME")?).join(".claude/ide");

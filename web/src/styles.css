@@ -82,17 +82,18 @@ body {
   outline: none;
 }
 .panel.focused { border-color: var(--accent); }
-.panel.sessions { grid-area: sessions; }
-.panel.terminal { grid-area: terminal; }
-.panel.changes { grid-area: changes; }
-.panel.servers { grid-area: servers; }
+.p-sessions { grid-area: sessions; }
+.p-terminal { grid-area: terminal; }
+.p-changes { grid-area: changes; }
+.p-servers { grid-area: servers; }
 .panel-head {
   padding: 4px 8px;
   font-weight: 600;
   color: var(--muted);
   border-bottom: 1px solid var(--line);
 }
-.panel-body { flex: 1; min-height: 0; overflow: auto; }
+/* 안쪽 칸이 남은 높이를 받게 세로 flex 로 둔다 — height: 100% 는 높이가 정해지지 않은 flex 항목 안에서 풀리지 않는다. */
+.panel-body { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
 .empty { color: var(--muted); padding: 8px; margin: 0; }
 
 .sessions { list-style: none; margin: 0; padding: 0; }
@@ -135,10 +136,10 @@ button:disabled { opacity: 0.5; cursor: default; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.link { border: none; background: none; color: var(--accent); padding: 0 4px; }
 
-.term { display: flex; flex-direction: column; height: 100%; }
+.term { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .term-head { padding: 3px 8px; color: var(--muted); font-size: 12px; display: flex; gap: 6px; align-items: center; }
 .term-box { flex: 1; min-height: 0; padding: 2px 4px; background: var(--bg); }
-.panel.terminal .panel-body { overflow: hidden; }
+.p-terminal .panel-body { overflow: hidden; }
 
 .modal-back {
   position: fixed;
@@ -173,3 +174,30 @@ button.link { border: none; background: none; color: var(--accent); padding: 0 4
   margin: 3px 0;
   padding: 6px 8px;
 }
+
+.p-changes .panel-body { overflow: hidden; }
+.changes { display: grid; grid-template-rows: minmax(60px, 32%) auto minmax(0, 1fr) auto; flex: 1; min-height: 0; }
+.changes .files { overflow: auto; border-bottom: 1px solid var(--line); font-size: 12px; }
+.changes .wt-head { padding: 3px 8px; color: var(--muted); font-weight: 600; background: var(--bg); position: sticky; top: 0; }
+.changes .file { display: flex; gap: 6px; padding: 1px 8px; cursor: pointer; white-space: nowrap; }
+.changes .file.selected { background: var(--sel); box-shadow: inset 3px 0 var(--accent); }
+.changes .file .name { overflow: hidden; text-overflow: ellipsis; flex: 1; direction: rtl; text-align: left; }
+.changes .count, .changes .time { color: var(--muted); }
+.changes .plus { color: var(--busy); }
+.changes .minus { color: #cf222e; }
+.mark { width: 1em; text-align: center; flex: none; }
+.mark.committed { color: var(--busy); }
+.mark.changed { color: #1b7c83; }
+.mark.uncommitted { color: var(--warn); }
+.mark.gone, .mark.unknown { color: var(--muted); }
+.mark.worktree { color: #8250df; }
+.changes .diff-head { display: flex; gap: 8px; align-items: center; padding: 3px 8px; border-bottom: 1px solid var(--line); font-size: 12px; white-space: nowrap; overflow: hidden; }
+.changes .diff-head .rel { overflow: hidden; text-overflow: ellipsis; direction: rtl; }
+.changes .diff-head .spacer { flex: 1; }
+.changes .steps { display: flex; gap: 4px; align-items: center; }
+.changes .diff-box { position: relative; min-height: 0; }
+.changes .diff-box .monaco { position: absolute; inset: 0; }
+.changes .diff-box .empty { position: absolute; z-index: 1; }
+.changes .sel-bar { display: flex; gap: 8px; align-items: center; padding: 3px 8px; border-top: 1px solid var(--line); font-size: 12px; flex-wrap: wrap; }
+.changes .warn { color: var(--warn); }
+.changes .notice { color: var(--accent); }

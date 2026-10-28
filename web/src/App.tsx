@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { subscribe, type Conn } from "./api";
+import { Changes, type ChangesHandle } from "./Changes";
 import { ImportDialog, NewSessionDialog } from "./Dialogs";
 import { SessionList } from "./SessionList";
 import { Terminal, type TerminalHandle } from "./Terminal";
@@ -35,6 +36,7 @@ export function App() {
   const [now, setNow] = useState(() => Date.now() / 1000);
   const panels = useRef<Record<Panel, HTMLElement | null>>({ sessions: null, terminal: null, changes: null, servers: null });
   const terminal = useRef<TerminalHandle>(null);
+  const changes = useRef<ChangesHandle>(null);
   const [importing, setImporting] = useState<Session | null>(null);
   const [starting, setStarting] = useState(false);
   // 새로 띄운 pane — 목록에 나타나면 고른다(Claude 가 세션 파일을 쓰기까지 몇 초 걸린다).
@@ -89,7 +91,15 @@ export function App() {
         if (s) select(s.key);
       } else if (e.code === "KeyJ") {
         // 변경 칸으로 갔다가, 다시 누르면 터미널로 돌아온다.
-        panels.current[focused === "changes" ? "terminal" : "changes"]?.focus();
+        if (focused === "changes") terminal.current?.focus();
+        else panels.current.changes?.focus();
+      } else if (e.code === "KeyE") {
+        changes.current?.openInEditor();
+      } else if (e.code === "ArrowUp" || e.code === "ArrowDown") {
+        // 포커스는 그대로 두고 변경 칸만 움직인다 — 터미널에 입력하던 중이어도 된다.
+        const d = e.code === "ArrowUp" ? -1 : 1;
+        if (e.shiftKey) changes.current?.stepEdit(d);
+        else changes.current?.stepFile(d);
       } else {
         handled = false;
       }
@@ -124,7 +134,8 @@ export function App() {
         panels.current[p] = el;
       }}
       tabIndex={-1}
-      className={`panel ${p}${focused === p ? " focused" : ""}`}
+      // 칸 클래스는 p- 를 붙인다 — 안쪽 컴포넌트 클래스(changes 등)와 겹치지 않게.
+      className={`panel p-${p}${focused === p ? " focused" : ""}`}
       aria-label={label}
     >
       <header className="panel-head">{label}</header>
@@ -145,7 +156,7 @@ export function App() {
         )}
         {pendingPane && <span>새 세션 기다리는 중…</span>}
         <button onClick={() => setStarting(true)}>새 세션…</button>
-        <span className="hint">⌘1–9 세션 · ⌘J 변경 칸</span>
+        <span className="hint">⌘1–9 세션 · ⌘J 변경 칸 · ⌘↑↓ 파일 · ⌘⇧↑↓ 수정 · ⌘E 편집기</span>
       </div>
       {panel(
         "sessions",
@@ -153,7 +164,11 @@ export function App() {
         <SessionList sessions={sessions} selected={current?.key ?? null} onSelect={select} now={now} />,
       )}
       {panel("terminal", "터미널", <Terminal ref={terminal} session={current} onImport={setImporting} />)}
-      {panel("changes", "변경", <p className="empty">다음 단계: ccdiff 코어의 파일 목록과 diff</p>)}
+      {panel(
+        "changes",
+        "변경",
+        <Changes ref={changes} session={current} focusTerminal={() => terminal.current?.focus()} />,
+      )}
       {panel("servers", "서버", <p className="empty">다음 단계: dev 서버 로그</p>)}
       {importing && (
         <ImportDialog

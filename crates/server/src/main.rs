@@ -65,6 +65,7 @@ fn content_type(path: &str) -> &'static str {
         "png" => "image/png",
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
+        "woff" => "font/woff",
         "json" => "application/json",
         _ => "application/octet-stream",
     }
@@ -82,9 +83,13 @@ async fn static_file(uri: Uri) -> Response {
     };
     let mut resp = ([(header::CONTENT_TYPE, content_type(path))], *body).into_response();
     if path.ends_with(".html") {
+        // Monaco 가 실행 중에 <style> 을 넣어 style-src 에 'unsafe-inline' 이 필요하다. 이 화면은 바깥 HTML 을 그리지 않는다.
         resp.headers_mut().insert(
             header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static("default-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"),
+            HeaderValue::from_static(
+                "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; \
+                 worker-src 'self' blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+            ),
         );
     }
     resp
@@ -238,6 +243,27 @@ fn spawn_refresh(tmux: Tmux, reg: Shared, ide: Option<Arc<Mutex<Ide>>>) -> watch
     rx
 }
 
+/// 지난번 IDE 포트를 기억하는 파일 — 다시 시작해도 같은 포트를 쓰려고.
+fn ide_port_file() -> Option<PathBuf> {
+    let base = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("worktable/ide-port"))
+}
+
+/// IDE 를 연다. CLAUDE_CODE_SSE_PORT 로 띄운 Claude 는 그 포트에만 다시 붙으므로 지난번 포트를 먼저 시도한다.
+fn start_ide() -> Option<Arc<Mutex<Ide>>> {
+    let file = ide_port_file();
+    let prev = file.as_ref().and_then(|f| fs::read_to_string(f).ok()).and_then(|s| s.trim().parse().ok());
+    let ide = Ide::start_on("worktable", Vec::new(), prev)?;
+    if let Some(f) = &file {
+        let _ = f.parent().map(fs::create_dir_all);
+        let _ = fs::write(f, ide.port.to_string());
+    }
+    Some(Arc::new(Mutex::new(ide)))
+}
+
 /// Ctrl-C·SIGTERM 을 기다린다 — 끝날 때 IDE 잠금 파일을 지우려고 정상 종료한다.
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
@@ -329,7 +355,7 @@ async fn main() -> Result<()> {
     tmux.sweep_views();
 
     // Claude Code 의 /ide 가 붙는 곳. 세션마다 그 Claude 의 연결에만 선택을 보낸다.
-    let ide = Ide::start("worktable", Vec::new()).map(|i| Arc::new(Mutex::new(i)));
+    let ide = start_ide();
     if ide.is_none() {
         eprintln!("IDE 연결을 열지 못했다 — 줄 선택을 Claude 에 보낼 수 없다");
     }

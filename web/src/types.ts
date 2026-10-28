@@ -36,6 +36,10 @@ export interface Session {
   jsonl: string | null;
   compacts: number;
   edits: number;
+  /** 커밋되지 않은 세션 수정(●) 수 */
+  uncommitted: number;
+  /** 이 세션의 Claude 가 worktable IDE 에 붙어 있는가 */
+  ide: boolean;
   /** 유닉스 초. 기록이 없으면 0 */
   lastActivity: number;
   pane: Pane;
@@ -47,3 +51,36 @@ export interface Session {
 export type ServerEvent =
   | { type: "hello"; version: string }
   | { type: "sessions"; sessions: Session[] };
+
+/** ✓ committed · ◐ changed(커밋 전 더 고침) · ● uncommitted · ✗ gone · ◆ worktree(작업 트리) */
+export type Mark = "committed" | "changed" | "uncommitted" | "gone" | "worktree" | "unknown";
+
+export interface ChangeItem {
+  id: string;
+  kind: string;
+  path: string;
+  rel: string;
+  root: string | null;
+  worktree: string | null;
+  epoch: number;
+  added: number;
+  removed: number;
+  mark: Mark;
+  commit: { hash: string; subject: string } | null;
+  userModified: boolean;
+  secret: boolean;
+}
+
+export interface DiffInfo {
+  id: string;
+  path: string;
+  rel: string;
+  root: string | null;
+  kind: string;
+  /** 같은 파일을 고친 항목들(시간순, 작업 트리 항목이 있으면 맨 끝) */
+  seq: string[];
+}
+
+export type DiffResult =
+  | { secret: true; info: DiffInfo }
+  | { secret: false; info: DiffInfo; original: string; modified: string; partial: boolean; firstChange: number | null };
