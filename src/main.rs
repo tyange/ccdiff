@@ -1,223 +1,63 @@
+mod highlight;
+mod replay;
+mod rows;
+mod session;
+mod ui;
+
 use std::{
     collections::HashMap,
-    env,
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
-    time::Duration,
+    env, fs,
+    path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
 use ratatui::{
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+            MouseEvent, MouseEventKind,
+        },
         execute,
     },
-    layout::{Constraint, Layout, Position, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    DefaultTerminal, Frame,
+    layout::{Position, Rect},
+    widgets::ListState,
+    DefaultTerminal,
 };
-use serde_json::Value;
-use syntect::{
-    easy::HighlightLines,
-    highlighting::Theme,
-    parsing::{SyntaxReference, SyntaxSet},
-};
-use two_face::theme::EmbeddedThemeName;
 
-const MAX_CREATE_LINES: usize = 3000;
+use highlight::Highlighter;
+use replay::{Replay, Step};
+use rows::{build_rows, Row, RowKind};
+use session::{parse_entry, EditEntry, Tail};
 
-struct Hunk {
-    old_start: u64,
-    new_start: u64,
-    lines: Vec<String>,
+/// 한 파일의 수정들을 앞뒤로 넘기며 파일 전체로 보는 화면.
+pub struct FileView {
+    /// 같은 파일을 고친 수정들(entries 인덱스, 시간순).
+    pub seq: Vec<usize>,
+    pub pos: usize,
+    pub scroll: u16,
+    /// 다음 그리기에서 첫 변경 줄로 스크롤한다.
+    pub jump: bool,
+    pub replay: Option<Replay>,
 }
 
-struct EditEntry {
-    time: String,
-    kind: &'static str,
-    path: PathBuf,
-    root: Option<PathBuf>,
-    hunks: Vec<Hunk>,
-    added: usize,
-    removed: usize,
-    user_modified: bool,
-}
-
-impl EditEntry {
-    fn short_path(&self) -> String {
-        match &self.root {
-            Some(root) => {
-                let name = root.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                let rel = self.path.strip_prefix(root).unwrap_or(&self.path);
-                format!("{} · {}", name, rel.display())
-            }
-            None => self.path.display().to_string(),
-        }
-    }
-
-    /// 목록용 짧은 워크트리 이름: `abc-web-apps-gh2171` → `gh2171`, 메인 레포는 `main`.
-    fn label(&self) -> String {
-        let Some(root) = &self.root else { return "-".into() };
-        let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        match name.rfind("-gh") {
-            Some(i) => name[i + 1..].to_string(),
-            None if name.chars().any(|c| c == '-') && name.rsplit('-').next().is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) => {
-                name.rsplit('-').next().unwrap_or_default().to_string()
-            }
-            None => "main".into(),
-        }
-    }
-
-    fn file_name(&self) -> String {
-        self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-    }
-}
-
-/// 세션 JSONL 을 이어 읽는다. 쓰는 중인 마지막 줄은 다음 읽기까지 남겨 둔다.
-struct Tail {
-    path: PathBuf,
-    offset: u64,
-    partial: Vec<u8>,
-}
-
-impl Tail {
-    fn read_lines(&mut self) -> Result<Vec<String>> {
-        let mut f = File::open(&self.path)?;
-        let len = f.metadata()?.len();
-        if len < self.offset {
-            self.offset = 0;
-            self.partial.clear();
-        }
-        if len == self.offset {
-            return Ok(Vec::new());
-        }
-        f.seek(SeekFrom::Start(self.offset))?;
-        f.take(len - self.offset).read_to_end(&mut self.partial)?;
-        self.offset = len;
-
-        let mut lines = Vec::new();
-        let mut start = 0;
-        for (i, b) in self.partial.iter().enumerate() {
-            if *b == b'\n' {
-                lines.push(String::from_utf8_lossy(&self.partial[start..i]).into_owned());
-                start = i + 1;
-            }
-        }
-        self.partial.drain(..start);
-        Ok(lines)
-    }
-}
-
-fn git_root(dir: &Path) -> Option<PathBuf> {
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        if d.join(".git").exists() {
-            return Some(d.to_path_buf());
-        }
-        cur = d.parent();
-    }
-    None
-}
-
-fn local_time(ts: Option<&str>) -> String {
-    ts.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "--".into())
-}
-
-fn parse_entry(line: &str, roots: &mut HashMap<PathBuf, Option<PathBuf>>) -> Option<EditEntry> {
-    // 기록 대부분은 수정과 무관하다 — JSON 파싱 전에 문자열로 거른다.
-    if !line.contains("\"toolUseResult\"") || !line.contains("\"filePath\"") {
-        return None;
-    }
-    let v: Value = serde_json::from_str(line).ok()?;
-    let r = v.get("toolUseResult")?;
-    let path = PathBuf::from(r.get("filePath")?.as_str()?);
-
-    let kind = if r.get("oldString").is_some() {
-        "Edit"
-    } else if r.get("edits").is_some() {
-        "MultiEdit"
-    } else {
-        match r.get("type").and_then(Value::as_str) {
-            Some("create") => "Write+",
-            Some("update") => "Write",
-            _ => return None,
-        }
-    };
-
-    let mut hunks: Vec<Hunk> = r
-        .get("structuredPatch")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .map(|h| Hunk {
-                    old_start: h.get("oldStart").and_then(Value::as_u64).unwrap_or(0),
-                    new_start: h.get("newStart").and_then(Value::as_u64).unwrap_or(0),
-                    lines: h
-                        .get("lines")
-                        .and_then(Value::as_array)
-                        .map(|ls| ls.iter().filter_map(|l| l.as_str().map(String::from)).collect())
-                        .unwrap_or_default(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // 새 파일은 patch 가 비어 있고 전체 내용만 온다.
-    if hunks.is_empty() && kind == "Write+" {
-        if let Some(content) = r.get("content").and_then(Value::as_str) {
-            hunks.push(Hunk {
-                old_start: 0,
-                new_start: 1,
-                lines: content.lines().take(MAX_CREATE_LINES).map(|l| format!("+{l}")).collect(),
-            });
-        }
-    }
-
-    let (mut added, mut removed) = (0, 0);
-    for l in hunks.iter().flat_map(|h| &h.lines) {
-        match l.chars().next() {
-            Some('+') => added += 1,
-            Some('-') => removed += 1,
-            _ => {}
-        }
-    }
-
-    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let root = roots.entry(dir.clone()).or_insert_with(|| git_root(&dir)).clone();
-
-    Some(EditEntry {
-        time: local_time(v.get("timestamp").and_then(Value::as_str)),
-        kind,
-        path,
-        root,
-        hunks,
-        added,
-        removed,
-        user_modified: r.get("userModified").and_then(Value::as_bool).unwrap_or(false),
-    })
-}
-
-struct App {
-    session: String,
+pub struct App {
+    pub session: String,
     tail: Tail,
     roots: HashMap<PathBuf, Option<PathBuf>>,
-    entries: Vec<EditEntry>,
+    pub entries: Vec<EditEntry>,
     repo_order: Vec<Option<PathBuf>>,
     filter: Option<usize>,
-    list: ListState,
-    follow: bool,
-    scroll: u16,
-    hscroll: u16,
+    pub list: ListState,
+    pub follow: bool,
+    pub scroll: u16,
+    pub hscroll: u16,
     hide_outside: bool,
-    list_area: Rect,
-    diff_area: Rect,
-    hl: Highlighter,
-    rendered: HashMap<usize, Vec<Line<'static>>>,
+    pub list_area: Rect,
+    pub diff_area: Rect,
+    pub hl: Highlighter,
+    pub rows: HashMap<usize, Vec<Row>>,
+    pub file: Option<FileView>,
 }
 
 impl App {
@@ -227,6 +67,11 @@ impl App {
             if let Some(e) = parse_entry(&line, &mut self.roots) {
                 if !self.repo_order.contains(&e.root) {
                     self.repo_order.push(e.root.clone());
+                }
+                if let Some(fv) = &mut self.file {
+                    if self.entries[fv.seq[0]].path == e.path {
+                        fv.seq.push(self.entries.len());
+                    }
                 }
                 self.entries.push(e);
                 changed = true;
@@ -238,12 +83,24 @@ impl App {
         Ok(changed)
     }
 
-    fn visible(&self) -> Vec<usize> {
+    pub fn ensure_rows(&mut self, i: usize) {
+        if !self.rows.contains_key(&i) {
+            let rows = build_rows(&self.entries[i], &self.hl);
+            self.rows.insert(i, rows);
+        }
+    }
+
+    pub fn visible(&self) -> Vec<usize> {
         let want = self.filter.map(|i| &self.repo_order[i]);
         (0..self.entries.len())
             .filter(|&i| want.is_none_or(|r| &self.entries[i].root == r))
             .filter(|&i| !self.hide_outside || self.entries[i].root.is_some())
             .collect()
+    }
+
+    fn selected_entry(&self) -> Option<usize> {
+        let v = self.visible();
+        self.list.selected().and_then(|s| v.get(s)).copied()
     }
 
     fn select_last(&mut self) {
@@ -264,8 +121,88 @@ impl App {
         self.scroll = 0;
     }
 
+    fn cycle_filter(&mut self) {
+        if self.repo_order.is_empty() {
+            return;
+        }
+        self.filter = match self.filter {
+            None => Some(0),
+            Some(i) if i + 1 < self.repo_order.len() => Some(i + 1),
+            Some(_) => None,
+        };
+        self.follow = true;
+        self.select_last();
+    }
+
+    pub fn filter_label(&self) -> String {
+        match self.filter {
+            None => "전체".into(),
+            Some(i) => match &self.repo_order[i] {
+                Some(r) => r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                None => "(git 밖)".into(),
+            },
+        }
+    }
+
+    fn open_file(&mut self) {
+        let Some(idx) = self.selected_entry() else { return };
+        let path = &self.entries[idx].path;
+        let seq: Vec<usize> = (0..self.entries.len()).filter(|&i| &self.entries[i].path == path).collect();
+        let pos = seq.iter().position(|&i| i == idx).unwrap_or(0);
+        self.hscroll = 0;
+        self.file = Some(FileView { seq, pos, scroll: 0, jump: true, replay: None });
+    }
+
+    fn file_step(&mut self, delta: isize) {
+        if let Some(fv) = &mut self.file {
+            let next = (fv.pos as isize + delta).clamp(0, fv.seq.len() as isize - 1) as usize;
+            fv.pos = next;
+            fv.jump = true;
+            fv.replay = None;
+        }
+    }
+
+    fn start_replay(&mut self) {
+        if let Some(fv) = &mut self.file {
+            fv.pos = 0;
+            fv.replay = Some(Replay::new());
+        }
+    }
+
+    fn replaying(&self) -> bool {
+        self.file.as_ref().and_then(|v| v.replay.as_ref()).is_some_and(|r| !r.paused)
+    }
+
+    fn tick_replay(&mut self) {
+        let Some(idx) = self.file.as_ref().filter(|v| v.replay.is_some()).map(|v| v.seq[v.pos]) else { return };
+        self.ensure_rows(idx);
+        let rows = &self.rows[&idx];
+        let total: usize = rows.iter().filter(|r| r.kind == RowKind::Add).map(|r| r.width() + 1).sum();
+        let has_del = rows.iter().any(|r| r.kind == RowKind::Del);
+        let fv = self.file.as_mut().expect("file view");
+        let Some(rp) = fv.replay.as_mut() else { return };
+        if let Step::Next = rp.tick(total, has_del) {
+            if fv.pos + 1 < fv.seq.len() {
+                fv.pos += 1;
+                rp.restart_edit();
+            } else {
+                fv.replay = None;
+            }
+        }
+    }
+
     fn on_mouse(&mut self, m: &MouseEvent) {
         let pos = Position::new(m.column, m.row);
+        if let Some(fv) = &mut self.file {
+            if fv.replay.is_none() {
+                match m.kind {
+                    MouseEventKind::ScrollDown => fv.scroll = fv.scroll.saturating_add(3),
+                    MouseEventKind::ScrollUp => fv.scroll = fv.scroll.saturating_sub(3),
+                    _ => {}
+                }
+            }
+            return;
+        }
         let in_list = self.list_area.contains(pos);
         match m.kind {
             MouseEventKind::ScrollDown if in_list => self.move_by(1),
@@ -285,362 +222,129 @@ impl App {
         }
     }
 
-    fn cycle_filter(&mut self) {
-        if self.repo_order.is_empty() {
-            return;
+    /// true 를 돌려주면 종료한다.
+    fn on_key(&mut self, k: KeyEvent) -> bool {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Char('c') if ctrl => return true,
+            KeyCode::Char('t') => {
+                self.hl.next_theme();
+                self.rows.clear();
+                return false;
+            }
+            KeyCode::Char('b') => {
+                self.hl.light = !self.hl.light;
+                self.rows.clear();
+                return false;
+            }
+            KeyCode::Right => {
+                self.hscroll = self.hscroll.saturating_add(8);
+                return false;
+            }
+            KeyCode::Left => {
+                self.hscroll = self.hscroll.saturating_sub(8);
+                return false;
+            }
+            _ => {}
         }
-        self.filter = match self.filter {
-            None => Some(0),
-            Some(i) if i + 1 < self.repo_order.len() => Some(i + 1),
-            Some(_) => None,
-        };
-        self.follow = true;
-        self.select_last();
-    }
-
-    fn filter_label(&self) -> String {
-        match self.filter {
-            None => "전체".into(),
-            Some(i) => match &self.repo_order[i] {
-                Some(r) => r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                None => "(git 밖)".into(),
-            },
-        }
-    }
-}
-
-fn truncate_left(s: &str, width: usize) -> String {
-    let n = s.chars().count();
-    if n <= width || width < 2 {
-        return s.to_string();
-    }
-    let tail: String = s.chars().skip(n - (width - 1)).collect();
-    format!("…{tail}")
-}
-
-const DARK_THEMES: &[(&str, EmbeddedThemeName)] = &[
-    ("Catppuccin Mocha", EmbeddedThemeName::CatppuccinMocha),
-    ("Dracula", EmbeddedThemeName::Dracula),
-    ("TwoDark", EmbeddedThemeName::TwoDark),
-    ("Monokai", EmbeddedThemeName::MonokaiExtended),
-    ("Gruvbox Dark", EmbeddedThemeName::GruvboxDark),
-    ("Nord", EmbeddedThemeName::Nord),
-];
-
-const LIGHT_THEMES: &[(&str, EmbeddedThemeName)] = &[
-    ("GitHub", EmbeddedThemeName::Github),
-    ("Catppuccin Latte", EmbeddedThemeName::CatppuccinLatte),
-    ("One Half Light", EmbeddedThemeName::OneHalfLight),
-    ("Solarized Light", EmbeddedThemeName::SolarizedLight),
-    ("Gruvbox Light", EmbeddedThemeName::GruvboxLight),
-];
-
-/// Ghostty 테마가 macOS 외관을 따르므로 같은 값을 본다. CCDIFF_BG=light|dark 가 있으면 그게 우선.
-fn system_is_light() -> bool {
-    match env::var("CCDIFF_BG").as_deref() {
-        Ok("light") => return true,
-        Ok("dark") => return false,
-        _ => {}
-    }
-    std::process::Command::new("defaults")
-        .args(["read", "-g", "AppleInterfaceStyle"])
-        .output()
-        .map(|o| !String::from_utf8_lossy(&o.stdout).contains("Dark"))
-        .unwrap_or(false)
-}
-
-struct Highlighter {
-    syntaxes: SyntaxSet,
-    dark: Vec<Theme>,
-    light_themes: Vec<Theme>,
-    light: bool,
-    system_light: bool,
-    cur_dark: usize,
-    cur_light: usize,
-}
-
-impl Highlighter {
-    fn new() -> Self {
-        let set = two_face::theme::extra();
-        let load = |list: &[(&str, EmbeddedThemeName)]| list.iter().map(|(_, t)| set.get(*t).clone()).collect();
-        Self {
-            syntaxes: two_face::syntax::extra_newlines(),
-            dark: load(DARK_THEMES),
-            light_themes: load(LIGHT_THEMES),
-            light: system_is_light(),
-            system_light: system_is_light(),
-            cur_dark: 0,
-            cur_light: 0,
-        }
-    }
-
-    fn theme(&self) -> &Theme {
-        if self.light { &self.light_themes[self.cur_light] } else { &self.dark[self.cur_dark] }
-    }
-
-    fn theme_name(&self) -> &'static str {
-        if self.light { LIGHT_THEMES[self.cur_light].0 } else { DARK_THEMES[self.cur_dark].0 }
-    }
-
-    fn next_theme(&mut self) {
-        if self.light {
-            self.cur_light = (self.cur_light + 1) % self.light_themes.len();
-        } else {
-            self.cur_dark = (self.cur_dark + 1) % self.dark.len();
-        }
-    }
-
-    /// 바뀌었으면 true — 호출부가 렌더 캐시를 비운다.
-    fn sync_background(&mut self) -> bool {
-        // 시스템 외관이 바뀐 순간에만 따라간다 — b 로 직접 고른 값은 그대로 둔다.
-        let now = system_is_light();
-        if now == self.system_light {
+        if self.file.is_some() {
+            self.on_file_key(k, ctrl);
             return false;
         }
-        self.system_light = now;
-        self.light = now;
-        true
-    }
-
-    fn diff_bgs(&self) -> (Color, Color) {
-        if self.light {
-            (Color::Rgb(218, 251, 225), Color::Rgb(255, 228, 226))
-        } else {
-            (Color::Rgb(30, 66, 44), Color::Rgb(80, 34, 40))
-        }
-    }
-
-    fn syntax_for(&self, path: &Path) -> &SyntaxReference {
-        path.extension()
-            .and_then(|x| x.to_str())
-            .and_then(|x| self.syntaxes.find_syntax_by_extension(x))
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text())
-    }
-}
-
-fn diff_lines(e: &EditEntry, hl: &Highlighter) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    if e.user_modified {
-        out.push(Line::from(Span::styled(
-            "사용자가 승인 전에 손으로 고친 수정",
-            Style::default().fg(Color::Magenta),
-        )));
-    }
-    if e.hunks.is_empty() {
-        out.push(Line::from("(diff 없음)"));
-    }
-    let gutter = Style::default().fg(Color::DarkGray);
-    let (add_bg, del_bg) = hl.diff_bgs();
-    // hunk 는 파일 조각이라 문법 상태가 조각 사이에서 끊긴다 — 조각마다 새로 시작한다.
-    for h in &e.hunks {
-        let mut hi = HighlightLines::new(hl.syntax_for(&e.path), hl.theme());
-        out.push(Line::from(""));
-        out.push(Line::from(Span::styled(
-            format!("@@ -{} +{} @@", h.old_start, h.new_start),
-            Style::default().fg(Color::Cyan),
-        )));
-        let (mut old, mut new) = (h.old_start, h.new_start);
-        for l in &h.lines {
-            let mut chars = l.chars();
-            let mark = chars.next().unwrap_or(' ');
-            let code = chars.as_str();
-            let (o, n, bg, mark_fg) = match mark {
-                '+' => {
-                    new += 1;
-                    (String::new(), (new - 1).to_string(), Some(add_bg), Color::Green)
-                }
-                '-' => {
-                    old += 1;
-                    ((old - 1).to_string(), String::new(), Some(del_bg), Color::Red)
-                }
-                _ => {
-                    old += 1;
-                    new += 1;
-                    ((old - 1).to_string(), (new - 1).to_string(), None, Color::DarkGray)
-                }
-            };
-            let with_bg = |st: Style| match bg {
-                Some(c) => st.bg(c),
-                None => st,
-            };
-            let mut spans = vec![
-                Span::styled(format!("{o:>5} {n:>5} "), gutter),
-                Span::styled(format!("{mark} "), with_bg(Style::default().fg(mark_fg))),
-            ];
-            let line = format!("{code}\n");
-            match hi.highlight_line(&line, &hl.syntaxes) {
-                Ok(parts) => spans.extend(parts.into_iter().map(|(st, text)| {
-                    let c = st.foreground;
-                    Span::styled(
-                        text.trim_end_matches('\n').to_string(),
-                        with_bg(Style::default().fg(Color::Rgb(c.r, c.g, c.b))),
-                    )
-                })),
-                Err(_) => spans.push(Span::styled(code.to_string(), with_bg(Style::default()))),
+        match k.code {
+            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Enter | KeyCode::Char('o') => self.open_file(),
+            KeyCode::Char('d') if ctrl => self.scroll = self.scroll.saturating_add(20),
+            KeyCode::Char('u') if ctrl => self.scroll = self.scroll.saturating_sub(20),
+            KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
+            KeyCode::Char('J') => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::Char('K') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(20),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(20),
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.follow = false;
+                self.move_by(isize::MIN / 2);
             }
-            // 바뀐 줄은 배경을 줄 끝까지 칠해야 글자 길이와 상관없이 한눈에 보인다.
-            if bg.is_some() {
-                let used: usize = code.chars().count();
-                spans.push(Span::styled(" ".repeat(400usize.saturating_sub(used)), with_bg(Style::default())));
+            KeyCode::Char('G') | KeyCode::End => {
+                self.follow = true;
+                self.select_last();
             }
-            out.push(Line::from(spans));
+            KeyCode::Char('f') => {
+                self.follow = !self.follow;
+                if self.follow {
+                    self.select_last();
+                }
+            }
+            KeyCode::Char('w') => self.cycle_filter(),
+            KeyCode::Char('h') => {
+                self.hide_outside = !self.hide_outside;
+                self.follow = true;
+                self.select_last();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn on_file_key(&mut self, k: KeyEvent, ctrl: bool) {
+        match k.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                let fv = self.file.as_mut().expect("file view");
+                if fv.replay.is_some() {
+                    fv.replay = None;
+                } else {
+                    self.file = None;
+                }
+                return;
+            }
+            KeyCode::Char('n') | KeyCode::Char(']') => return self.file_step(1),
+            KeyCode::Char('p') | KeyCode::Char('[') => return self.file_step(-1),
+            KeyCode::Char('r') => return self.start_replay(),
+            KeyCode::Char(' ') => {
+                if let Some(rp) = self.file.as_mut().and_then(|v| v.replay.as_mut()) {
+                    rp.toggle_pause();
+                }
+                return;
+            }
+            _ => {}
+        }
+        let fv = self.file.as_mut().expect("file view");
+        match k.code {
+            KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down => fv.scroll = fv.scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up => fv.scroll = fv.scroll.saturating_sub(1),
+            KeyCode::Char('d') if ctrl => fv.scroll = fv.scroll.saturating_add(20),
+            KeyCode::Char('u') if ctrl => fv.scroll = fv.scroll.saturating_sub(20),
+            KeyCode::PageDown => fv.scroll = fv.scroll.saturating_add(20),
+            KeyCode::PageUp => fv.scroll = fv.scroll.saturating_sub(20),
+            KeyCode::Char('g') | KeyCode::Home => fv.scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => fv.scroll = u16::MAX,
+            _ => {}
         }
     }
-    out
-}
-
-fn draw(f: &mut Frame, app: &mut App) {
-    let [main, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
-    // 좁은 pane(tmux 반쪽 등)에서는 목록을 위, diff 를 아래로 쌓는다.
-    let [left, right] = if main.width < 140 {
-        Layout::vertical([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(main)
-    } else {
-        Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).areas(main)
-    };
-
-    let visible = app.visible();
-    let today = chrono::Local::now().date_naive();
-    let md = |d: chrono::NaiveDate| d.format("%m-%d").to_string();
-    let (today_md, yday_md) = (md(today), today.pred_opt().map(md).unwrap_or_default());
-    let name_width = (left.width as usize).saturating_sub(42);
-    let items: Vec<ListItem> = visible
-        .iter()
-        .map(|&i| {
-            let e = &app.entries[i];
-            let hm = e.time.get(6..11).unwrap_or(&e.time);
-            let day = e.time.get(0..5).unwrap_or("");
-            // 한글 두 글자는 4칸이라 공백 하나를 더해 `10-27`(5칸)과 폭을 맞춘다.
-            let (day_label, day_style) = if day == today_md {
-                ("오늘 ".to_string(), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
-            } else if day == yday_md {
-                ("어제 ".to_string(), Style::default().fg(Color::Magenta))
-            } else {
-                (day.to_string(), Style::default().fg(Color::DarkGray))
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{day_label} "), day_style),
-                Span::raw(format!("{hm} ")),
-                Span::raw(format!("{:<7}", e.kind)),
-                Span::styled(format!("+{:<4}", e.added), Style::default().fg(Color::Green)),
-                Span::styled(format!("-{:<4} ", e.removed), Style::default().fg(Color::Red)),
-                Span::styled(format!("{:<8} ", e.label()), Style::default().fg(Color::Yellow)),
-                Span::raw(truncate_left(&e.file_name(), name_width)),
-            ]))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " 수정 {}건 · {} ",
-            visible.len(),
-            app.filter_label()
-        )))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
-        .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, left, &mut app.list);
-    app.list_area = left;
-    app.diff_area = right;
-
-    let sel_idx = app.list.selected().and_then(|s| visible.get(s)).copied();
-    if let Some(i) = sel_idx {
-        if !app.rendered.contains_key(&i) {
-            let lines = diff_lines(&app.entries[i], &app.hl);
-            app.rendered.insert(i, lines);
-        }
-    }
-    let selected = sel_idx.map(|i| &app.entries[i]);
-    let title_width = (right.width as usize).saturating_sub(4);
-    let title = match selected {
-        Some(e) => {
-            let head = format!(" {} · {} · ", e.time, e.label());
-            let rel = match &e.root {
-                Some(r) => e.path.strip_prefix(r).unwrap_or(&e.path).display().to_string(),
-                None => e.path.display().to_string(),
-            };
-            let room = title_width.saturating_sub(head.chars().count() + 1);
-            format!("{head}{} ", truncate_left(&rel, room))
-        }
-        None => format!(" {} ", app.session),
-    };
-    let body = sel_idx
-        .and_then(|i| app.rendered.get(&i).cloned())
-        .unwrap_or_else(|| vec![Line::from("아직 수정이 없다")]);
-    let diff = Paragraph::new(body)
-        .block(Block::default().borders(Borders::ALL).title(truncate_left(&title, title_width)))
-        .scroll((app.scroll, app.hscroll));
-    f.render_widget(diff, right);
-
-    let follow = if app.follow { "따라가기 켜짐" } else { "따라가기 꺼짐" };
-    let theme = app.hl.theme_name();
-    f.render_widget(
-        Paragraph::new(format!(
-            " {follow} · {theme} │ t 테마 · b 밝기 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · h git 밖 · q 종료"
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
-        status,
-    );
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
-    let mut ticks: u32 = 0;
+    let mut last_sync = Instant::now();
     loop {
-        ticks = ticks.wrapping_add(1);
-        if ticks % 20 == 0 && app.hl.sync_background() {
-            app.rendered.clear();
-        }
-        terminal.draw(|f| draw(f, app))?;
-        if event::poll(Duration::from_millis(300))? {
-            let ev = event::read()?;
-            if let Event::Mouse(m) = &ev {
-                app.on_mouse(m);
+        if last_sync.elapsed() >= Duration::from_secs(3) {
+            last_sync = Instant::now();
+            if app.hl.sync_background() {
+                app.rows.clear();
             }
-            if let Event::Key(k) = ev {
-                if k.kind != KeyEventKind::Press {
-                    continue;
+        }
+        app.tick_replay();
+        terminal.draw(|f| ui::draw(f, app))?;
+        let wait = if app.replaying() { 30 } else { 300 };
+        if event::poll(Duration::from_millis(wait))? {
+            match event::read()? {
+                Event::Mouse(m) => app.on_mouse(&m),
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    if app.on_key(k) {
+                        return Ok(());
+                    }
                 }
-                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') if ctrl => return Ok(()),
-                    KeyCode::Char('d') if ctrl => app.scroll = app.scroll.saturating_add(20),
-                    KeyCode::Char('u') if ctrl => app.scroll = app.scroll.saturating_sub(20),
-                    KeyCode::Char('j') | KeyCode::Down => app.move_by(1),
-                    KeyCode::Char('k') | KeyCode::Up => app.move_by(-1),
-                    KeyCode::Char('J') => app.scroll = app.scroll.saturating_add(1),
-                    KeyCode::Char('K') => app.scroll = app.scroll.saturating_sub(1),
-                    KeyCode::PageDown => app.scroll = app.scroll.saturating_add(20),
-                    KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(20),
-                    KeyCode::Right => app.hscroll = app.hscroll.saturating_add(8),
-                    KeyCode::Left => app.hscroll = app.hscroll.saturating_sub(8),
-                    KeyCode::Char('g') | KeyCode::Home => {
-                        app.follow = false;
-                        app.move_by(isize::MIN / 2);
-                    }
-                    KeyCode::Char('G') | KeyCode::End => {
-                        app.follow = true;
-                        app.select_last();
-                    }
-                    KeyCode::Char('f') => {
-                        app.follow = !app.follow;
-                        if app.follow {
-                            app.select_last();
-                        }
-                    }
-                    KeyCode::Char('w') => app.cycle_filter(),
-                    KeyCode::Char('b') => {
-                        app.hl.light = !app.hl.light;
-                        app.rendered.clear();
-                    }
-                    KeyCode::Char('t') => {
-                        app.hl.next_theme();
-                        app.rendered.clear();
-                    }
-                    KeyCode::Char('h') => {
-                        app.hide_outside = !app.hide_outside;
-                        app.follow = true;
-                        app.select_last();
-                    }
-                    _ => {}
-                }
+                _ => {}
             }
         }
         app.ingest()?;
@@ -684,23 +388,26 @@ fn resolve_session(arg: Option<String>) -> Result<PathBuf> {
     newest.map(|e| e.path()).context("세션 기록이 없다")
 }
 
+fn args_verify() -> bool {
+    env::args().any(|a| a == "--verify")
+}
+
 fn main() -> Result<()> {
-    let mut args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).filter(|a| a != "--verify").collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
-            "사용: ccdiff [--list] [세션ID | 세션.jsonl]\n인자가 없으면 현재 디렉터리 프로젝트의 가장 최근 세션을 연다.\n--list 는 화면 없이 수정 목록만 출력한다."
+            "사용: ccdiff [--list | --verify] [세션ID | 세션.jsonl]\n인자가 없으면 현재 디렉터리 프로젝트의 가장 최근 세션을 연다.\n--list 는 화면 없이 수정 목록만 출력한다.\n--verify 는 되살린 파일이 다음 수정의 원본과 같은지 검사한다."
         );
         return Ok(());
     }
     let list_only = args.iter().any(|a| a == "--list");
     args.retain(|a| a != "--list");
-    let arg = args.into_iter().next();
-    let path = resolve_session(arg)?;
+    let path = resolve_session(args.into_iter().next())?;
     let session = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
     let mut app = App {
         session,
-        tail: Tail { path, offset: 0, partial: Vec::new() },
+        tail: Tail::new(path),
         roots: HashMap::new(),
         entries: Vec::new(),
         repo_order: Vec::new(),
@@ -713,10 +420,36 @@ fn main() -> Result<()> {
         list_area: Rect::default(),
         diff_area: Rect::default(),
         hl: Highlighter::new(),
-        rendered: HashMap::new(),
+        rows: HashMap::new(),
+        file: None,
     };
     app.ingest()?;
     app.select_last();
+
+    // 되살린 "수정 후 파일" 이 같은 파일의 다음 수정의 "수정 전 파일" 과 같은지 본다.
+    if args_verify() {
+        let (mut ok, mut bad) = (0, 0);
+        for i in 0..app.entries.len() {
+            let Some(j) = (i + 1..app.entries.len()).find(|&j| app.entries[j].path == app.entries[i].path) else { continue };
+            let Some(next_before) = app.entries[j].before.clone() else { continue };
+            app.ensure_rows(i);
+            let after: Vec<String> = app.rows[&i]
+                .iter()
+                .filter(|r| r.kind != RowKind::Del)
+                .map(|r| r.spans.iter().map(|(_, t)| t.as_str()).collect())
+                .collect();
+            let expect: Vec<&str> = next_before.lines().collect();
+            if after == expect {
+                ok += 1;
+            } else {
+                bad += 1;
+                let at = after.iter().zip(&expect).position(|(a, b)| a != b);
+                println!("불일치: {} {} (줄 {:?}, {}줄 vs {}줄)", app.entries[i].time, app.entries[i].short_path(), at.map(|x| x + 1), after.len(), expect.len());
+            }
+        }
+        println!("검증: 일치 {ok} · 불일치 {bad}");
+        return Ok(());
+    }
 
     if list_only {
         for e in app.visible().into_iter().map(|i| &app.entries[i]) {
