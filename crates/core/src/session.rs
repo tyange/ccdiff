@@ -107,6 +107,11 @@ impl Tail {
     }
 }
 
+/// Claude Code 의 프로젝트 기록 폴더 이름: cwd 의 영숫자 외 문자를 '-' 로 바꾼다.
+pub fn project_dir_name(cwd: &Path) -> String {
+    cwd.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
 pub fn git_root(dir: &Path) -> Option<PathBuf> {
     let mut cur = Some(dir);
     while let Some(d) = cur {

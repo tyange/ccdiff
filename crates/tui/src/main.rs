@@ -31,7 +31,10 @@ use highlight::Highlighter;
 use ccdiff_core::ide::Ide;
 use replay::{Replay, Step};
 use rows::{apply_highlight, build_rows, Row, RowKind};
-use ccdiff_core::{session::EditEntry, tracker::SessionTracker};
+use ccdiff_core::{
+    session::{self, EditEntry},
+    tracker::SessionTracker,
+};
 
 /// 작업 트리 항목의 키 시작값. 세션 수정은 0부터, 작업 트리 항목은 WT 부터 센다.
 pub const WT: usize = 1 << 40;
@@ -920,14 +923,7 @@ fn resolve_session(arg: Option<String>) -> Result<PathBuf> {
         }
         bail!("세션을 찾지 못했다: {a}");
     }
-    // Claude Code 는 cwd 의 영숫자 외 문자를 '-' 로 바꿔 프로젝트 폴더 이름을 만든다.
-    let cwd = env::current_dir()?;
-    let encoded: String = cwd
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let dir = projects.join(&encoded);
+    let dir = projects.join(session::project_dir_name(&env::current_dir()?));
     let newest = fs::read_dir(&dir)
         .with_context(|| format!("프로젝트 기록 폴더가 없다: {}", dir.display()))?
         .flatten()
