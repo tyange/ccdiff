@@ -400,10 +400,25 @@ impl App {
         }
     }
 
+    /// 선택 줄이 가리키는 것 — 키는 갱신 때 바뀔 수 있어 내용으로 비교한다.
+    fn selected_id(&self) -> Option<(bool, PathBuf, i64, &'static str)> {
+        let d = self.display();
+        let (header, key) = match self.list.selected().and_then(|s| d.get(s))? {
+            Disp::Header { key, .. } => (true, *key),
+            Disp::Item(key) => (false, *key),
+        };
+        let e = self.entry(key);
+        Some((header, e.path.clone(), e.epoch, e.kind))
+    }
+
+    /// 따라가기는 주기적으로 불린다 — 선택이 그대로면 읽던 스크롤을 두고, 바뀔 때만 맨 위로 보낸다.
     fn select_last(&mut self) {
+        let before = self.selected_id();
         let n = self.display().len();
         self.list.select(n.checked_sub(1));
-        self.scroll = 0;
+        if self.selected_id() != before {
+            self.scroll = 0;
+        }
     }
 
     fn move_by(&mut self, delta: isize) {
