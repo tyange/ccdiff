@@ -318,39 +318,96 @@ fn truncate_left(s: &str, width: usize) -> String {
     format!("…{tail}")
 }
 
-const THEMES: &[(&str, EmbeddedThemeName)] = &[
+const DARK_THEMES: &[(&str, EmbeddedThemeName)] = &[
     ("Catppuccin Mocha", EmbeddedThemeName::CatppuccinMocha),
     ("Dracula", EmbeddedThemeName::Dracula),
     ("TwoDark", EmbeddedThemeName::TwoDark),
     ("Monokai", EmbeddedThemeName::MonokaiExtended),
     ("Gruvbox Dark", EmbeddedThemeName::GruvboxDark),
     ("Nord", EmbeddedThemeName::Nord),
-    ("One Half Dark", EmbeddedThemeName::OneHalfDark),
 ];
+
+const LIGHT_THEMES: &[(&str, EmbeddedThemeName)] = &[
+    ("GitHub", EmbeddedThemeName::Github),
+    ("Catppuccin Latte", EmbeddedThemeName::CatppuccinLatte),
+    ("One Half Light", EmbeddedThemeName::OneHalfLight),
+    ("Solarized Light", EmbeddedThemeName::SolarizedLight),
+    ("Gruvbox Light", EmbeddedThemeName::GruvboxLight),
+];
+
+/// Ghostty 테마가 macOS 외관을 따르므로 같은 값을 본다. CCDIFF_BG=light|dark 가 있으면 그게 우선.
+fn system_is_light() -> bool {
+    match env::var("CCDIFF_BG").as_deref() {
+        Ok("light") => return true,
+        Ok("dark") => return false,
+        _ => {}
+    }
+    std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).contains("Dark"))
+        .unwrap_or(false)
+}
 
 struct Highlighter {
     syntaxes: SyntaxSet,
-    themes: Vec<Theme>,
-    current: usize,
+    dark: Vec<Theme>,
+    light_themes: Vec<Theme>,
+    light: bool,
+    system_light: bool,
+    cur_dark: usize,
+    cur_light: usize,
 }
 
 impl Highlighter {
     fn new() -> Self {
         let set = two_face::theme::extra();
-        let themes = THEMES.iter().map(|(_, t)| set.get(*t).clone()).collect();
-        Self { syntaxes: two_face::syntax::extra_newlines(), themes, current: 0 }
+        let load = |list: &[(&str, EmbeddedThemeName)]| list.iter().map(|(_, t)| set.get(*t).clone()).collect();
+        Self {
+            syntaxes: two_face::syntax::extra_newlines(),
+            dark: load(DARK_THEMES),
+            light_themes: load(LIGHT_THEMES),
+            light: system_is_light(),
+            system_light: system_is_light(),
+            cur_dark: 0,
+            cur_light: 0,
+        }
     }
 
     fn theme(&self) -> &Theme {
-        &self.themes[self.current]
+        if self.light { &self.light_themes[self.cur_light] } else { &self.dark[self.cur_dark] }
     }
 
     fn theme_name(&self) -> &'static str {
-        THEMES[self.current].0
+        if self.light { LIGHT_THEMES[self.cur_light].0 } else { DARK_THEMES[self.cur_dark].0 }
     }
 
     fn next_theme(&mut self) {
-        self.current = (self.current + 1) % self.themes.len();
+        if self.light {
+            self.cur_light = (self.cur_light + 1) % self.light_themes.len();
+        } else {
+            self.cur_dark = (self.cur_dark + 1) % self.dark.len();
+        }
+    }
+
+    /// 바뀌었으면 true — 호출부가 렌더 캐시를 비운다.
+    fn sync_background(&mut self) -> bool {
+        // 시스템 외관이 바뀐 순간에만 따라간다 — b 로 직접 고른 값은 그대로 둔다.
+        let now = system_is_light();
+        if now == self.system_light {
+            return false;
+        }
+        self.system_light = now;
+        self.light = now;
+        true
+    }
+
+    fn diff_bgs(&self) -> (Color, Color) {
+        if self.light {
+            (Color::Rgb(218, 251, 225), Color::Rgb(255, 228, 226))
+        } else {
+            (Color::Rgb(30, 66, 44), Color::Rgb(80, 34, 40))
+        }
     }
 
     fn syntax_for(&self, path: &Path) -> &SyntaxReference {
@@ -373,8 +430,7 @@ fn diff_lines(e: &EditEntry, hl: &Highlighter) -> Vec<Line<'static>> {
         out.push(Line::from("(diff 없음)"));
     }
     let gutter = Style::default().fg(Color::DarkGray);
-    let add_bg = Color::Rgb(30, 66, 44);
-    let del_bg = Color::Rgb(80, 34, 40);
+    let (add_bg, del_bg) = hl.diff_bgs();
     // hunk 는 파일 조각이라 문법 상태가 조각 사이에서 끊긴다 — 조각마다 새로 시작한다.
     for h in &e.hunks {
         let mut hi = HighlightLines::new(hl.syntax_for(&e.path), hl.theme());
@@ -504,7 +560,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let theme = app.hl.theme_name();
     f.render_widget(
         Paragraph::new(format!(
-            " {follow} · {theme} │ t 테마 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · h git 밖 · q 종료"
+            " {follow} · {theme} │ t 테마 · b 밝기 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · h git 밖 · q 종료"
         ))
         .style(Style::default().fg(Color::DarkGray)),
         status,
@@ -512,7 +568,12 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+    let mut ticks: u32 = 0;
     loop {
+        ticks = ticks.wrapping_add(1);
+        if ticks % 20 == 0 && app.hl.sync_background() {
+            app.rendered.clear();
+        }
         terminal.draw(|f| draw(f, app))?;
         if event::poll(Duration::from_millis(300))? {
             let ev = event::read()?;
@@ -552,6 +613,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                         }
                     }
                     KeyCode::Char('w') => app.cycle_filter(),
+                    KeyCode::Char('b') => {
+                        app.hl.light = !app.hl.light;
+                        app.rendered.clear();
+                    }
                     KeyCode::Char('t') => {
                         app.hl.next_theme();
                         app.rendered.clear();
