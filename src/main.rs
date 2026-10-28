@@ -1,3 +1,4 @@
+mod bg;
 mod git;
 mod highlight;
 mod replay;
@@ -27,10 +28,11 @@ use ratatui::{
     DefaultTerminal,
 };
 
-use git::{CommitState, GitIndex};
+use bg::{run_git, GitDone, GitReq, GitWorker, HlJob, HlWorker};
+use git::{query, CommitState, GitIndex};
 use highlight::Highlighter;
 use replay::{Replay, Step};
-use rows::{build_rows, Row, RowKind};
+use rows::{apply_highlight, build_rows, Row, RowKind};
 use session::{bash_roots, parse_entry, EditEntry, Tail};
 
 /// 작업 트리 항목의 키 시작값. 세션 수정은 0부터, 작업 트리 항목은 WT 부터 센다.
@@ -71,7 +73,15 @@ pub struct App {
     pub hl: Highlighter,
     pub rows: HashMap<usize, Vec<Row>>,
     pub file: Option<FileView>,
-    git: GitIndex,
+    hlw: HlWorker,
+    gitw: GitWorker,
+    git_busy: bool,
+    /// 하이라이트 세대. 테마가 바뀌면 올라가고, 옛 결과는 버린다.
+    gen: u64,
+    /// 작업 트리 세대. 다시 읽을 때마다 올라간다 — 같은 키가 다른 파일을 가리킬 수 있어서.
+    wt_gen: u64,
+    /// 색을 기다리는 항목.
+    pub hl_wait: HashSet<usize>,
     pub commits: HashMap<usize, CommitState>,
     /// 0 전체 · 1 미커밋만 · 2 커밋만
     commit_filter: u8,
@@ -84,6 +94,14 @@ pub struct App {
     pub show_old_wt: bool,
     /// 펼친 워크트리 그룹. 기본은 접힘이고, 펼친 것만 실행 사이에 기억한다.
     expanded: HashSet<Option<PathBuf>>,
+}
+
+fn same_change(a: &EditEntry, b: &EditEntry) -> bool {
+    a.path == b.path
+        && a.kind == b.kind
+        && a.before == b.before
+        && a.hunks.len() == b.hunks.len()
+        && a.hunks.iter().zip(&b.hunks).all(|(x, y)| x.old_start == y.old_start && x.lines == y.lines)
 }
 
 /// 펼친 그룹 목록 파일. 한 줄에 워크트리 경로 하나, git 밖은 `-`.
@@ -150,21 +168,96 @@ impl App {
         if key >= WT { &self.wt[key - WT] } else { &self.entries[key] }
     }
 
+    /// 줄 목록은 바로 만들고 색은 백그라운드에 맡긴다 — 큰 파일에서 방향키가 끊기지 않게.
     pub fn ensure_rows(&mut self, key: usize) {
-        if !self.rows.contains_key(&key) {
-            let rows = build_rows(self.entry(key), &self.hl);
-            self.rows.insert(key, rows);
+        if self.rows.contains_key(&key) {
+            return;
+        }
+        let (rows, src) = build_rows(self.entry(key), &self.hl);
+        self.rows.insert(key, rows);
+        if let Some((before, after)) = src {
+            let job = HlJob { key, gen: self.tag(key), path: self.entry(key).path.clone(), before, after, sel: self.hl.selection() };
+            self.hlw.push(job);
+            self.hl_wait.insert(key);
         }
     }
 
-    /// 작업 트리 항목을 다시 읽는다. 열려 있는 파일 보기의 작업 트리 키도 새 번호로 맞춘다.
-    fn refresh_worktrees(&mut self) {
-        if self.wt_at.is_some_and(|t| t.elapsed() < WT_REFRESH) {
+    fn tag(&self, key: usize) -> u64 {
+        (self.gen << 32) | if key >= WT { self.wt_gen } else { 0 }
+    }
+
+    /// 테마가 바뀌었을 때: 만든 줄을 버리고 다시 칠하게 한다.
+    fn reset_highlight(&mut self) {
+        self.gen += 1;
+        self.rows.clear();
+        self.hl_wait.clear();
+        self.hlw.drop_older(self.gen << 32);
+    }
+
+    /// 백그라운드 결과를 받아 반영한다.
+    fn poll_bg(&mut self) {
+        while let Ok(d) = self.hlw.rx.try_recv() {
+            if d.gen != self.tag(d.key) {
+                continue;
+            }
+            if let Some(rows) = self.rows.get_mut(&d.key) {
+                apply_highlight(rows, &d.before, &d.after);
+            }
+            self.hl_wait.remove(&d.key);
+        }
+        while let Ok(done) = self.gitw.rx.try_recv() {
+            self.git_busy = false;
+            self.apply_git(done);
+        }
+    }
+
+    fn git_req(&self) -> GitReq {
+        let since = self.entries.iter().map(|e| e.epoch).filter(|&t| t > 0).min().unwrap_or(0) - 60;
+        // 커밋됨으로 판정된 것은 바뀌지 않으므로 다시 묻지 않는다.
+        let queries = (0..self.entries.len())
+            .filter(|i| !matches!(self.commits.get(i), Some(CommitState::Yes { .. } | CommitState::Changed { .. })))
+            .map(|i| query(i, &self.entries[i]))
+            .collect();
+        GitReq { roots: self.wt_roots.clone(), queries, since }
+    }
+
+    fn request_git(&mut self) {
+        if self.git_busy || self.wt_at.is_some_and(|t| t.elapsed() < WT_REFRESH) {
             return;
         }
         self.wt_at = Some(Instant::now());
-        self.wt = self.wt_roots.iter().flat_map(|r| worktree::entries(r)).collect();
+        self.gitw.send(self.git_req());
+        self.git_busy = true;
+    }
+
+    /// --list·--verify 용: 기다렸다가 바로 반영한다.
+    fn sync_git(&mut self) {
+        let done = run_git(&mut GitIndex::default(), &self.git_req());
+        self.apply_git(done);
+    }
+
+    /// 새로 읽은 작업 트리·커밋 판정을 반영한다. 열려 있는 파일 보기의 작업 트리 키도 새 번호로 맞춘다.
+    fn apply_git(&mut self, done: GitDone) {
+        for (k, st) in done.commits {
+            self.commits.insert(k, st);
+        }
+        // 내용이 그대로인 항목은 이미 만든 줄과 색을 새 키로 옮긴다 — 10초마다 색이 깜빡이지 않게.
+        let old = std::mem::take(&mut self.wt);
+        let mut keep: HashMap<usize, Vec<Row>> = HashMap::new();
+        for (j, e) in done.wt.iter().enumerate() {
+            let Some(oj) = old.iter().position(|o| same_change(o, e)) else { continue };
+            if self.hl_wait.contains(&(WT + oj)) {
+                continue;
+            }
+            if let Some(r) = self.rows.remove(&(WT + oj)) {
+                keep.insert(WT + j, r);
+            }
+        }
         self.rows.retain(|&k, _| k < WT);
+        self.hl_wait.retain(|&k| k < WT);
+        self.rows.extend(keep);
+        self.wt_gen += 1;
+        self.wt = done.wt;
         for e in &self.wt {
             if !self.repo_order.contains(&e.root) {
                 self.repo_order.push(e.root.clone());
@@ -220,24 +313,6 @@ impl App {
             1 => "미커밋만",
             2 => "커밋만",
             _ => "",
-        }
-    }
-
-    /// 판정이 안 됐거나 아직 미커밋인 수정만 다시 본다 — 커밋됨은 바뀌지 않는다.
-    fn refresh_commits(&mut self) {
-        let expired = self.git.expire();
-        let since = self.entries.iter().map(|e| e.epoch).filter(|&t| t > 0).min().unwrap_or(0) - 60;
-        for i in 0..self.entries.len() {
-            let known = self.commits.get(&i);
-            let recheck = match known {
-                None => true,
-                Some(CommitState::Yes { .. } | CommitState::Changed { .. }) => false,
-                Some(_) => expired,
-            };
-            if recheck {
-                let st = self.git.state(&self.entries[i], since);
-                self.commits.insert(i, st);
-            }
         }
     }
 
@@ -457,12 +532,12 @@ impl App {
             KeyCode::Char('c') if ctrl => return true,
             KeyCode::Char('t') => {
                 self.hl.next_theme();
-                self.rows.clear();
+                self.reset_highlight();
                 return false;
             }
             KeyCode::Char('b') => {
                 self.hl.light = !self.hl.light;
-                self.rows.clear();
+                self.reset_highlight();
                 return false;
             }
             KeyCode::Right => {
@@ -571,26 +646,32 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if last_sync.elapsed() >= Duration::from_secs(3) {
             last_sync = Instant::now();
             if app.hl.sync_background() {
-                app.rows.clear();
+                app.reset_highlight();
             }
         }
         app.tick_replay();
-        // git 호출이 화면을 잠깐 멈추게 하므로 재생 중에는 미룬다.
+        app.poll_bg();
         if !app.replaying() {
-            app.refresh_commits();
-            app.refresh_worktrees();
+            app.request_git();
         }
         terminal.draw(|f| ui::draw(f, app))?;
-        let wait = if app.replaying() { 30 } else { 300 };
+        let busy = app.replaying() || !app.hl_wait.is_empty() || app.git_busy;
+        let wait = if busy { 30 } else { 300 };
         if event::poll(Duration::from_millis(wait))? {
-            match event::read()? {
-                Event::Mouse(m) => app.on_mouse(&m),
-                Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    if app.on_key(k) {
-                        return Ok(());
+            // 키를 누르고 있으면 입력이 쌓인다 — 쌓인 만큼 처리한 뒤 한 번만 그린다.
+            for _ in 0..64 {
+                match event::read()? {
+                    Event::Mouse(m) => app.on_mouse(&m),
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        if app.on_key(k) {
+                            return Ok(());
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
         app.ingest()?;
@@ -668,7 +749,12 @@ fn main() -> Result<()> {
         hl: Highlighter::new(),
         rows: HashMap::new(),
         file: None,
-        git: GitIndex::default(),
+        hlw: HlWorker::spawn(),
+        gitw: GitWorker::spawn(),
+        git_busy: false,
+        gen: 0,
+        wt_gen: 0,
+        hl_wait: HashSet::new(),
         commits: HashMap::new(),
         commit_filter: 0,
         wt_roots: Vec::new(),
@@ -679,8 +765,9 @@ fn main() -> Result<()> {
         expanded: load_expanded(),
     };
     app.ingest()?;
-    app.refresh_commits();
-    app.refresh_worktrees();
+    if list_only || args_verify() {
+        app.sync_git();
+    }
     app.select_last();
 
     // 되살린 "수정 후 파일" 이 같은 파일의 다음 수정의 "수정 전 파일" 과 같은지 본다.
@@ -705,7 +792,6 @@ fn main() -> Result<()> {
             }
         }
         // 작업 트리 항목: HEAD 에 git diff 를 적용한 결과가 디스크의 지금 파일과 같아야 한다.
-        app.refresh_worktrees();
         for j in 0..app.wt.len() {
             let key = WT + j;
             let Ok(disk) = fs::read_to_string(&app.wt[j].path) else { continue };

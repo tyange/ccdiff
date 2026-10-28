@@ -220,6 +220,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
 
     let sel = app.selected_entry();
     let title_width = (right.width as usize).saturating_sub(4);
+    let mut clamped = None;
     let (title, body) = match sel {
         Some(i) => {
             app.ensure_rows(i);
@@ -233,11 +234,20 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
                     Style::default().fg(Color::Magenta),
                 )));
             }
-            body.extend(compact(rows).into_iter().map(|o| match o {
+            let plan = compact(rows);
+            let height = right.height.saturating_sub(2) as usize;
+            let total = body.len() + plan.len();
+            let sc = app.scroll.min(total.saturating_sub(height) as u16);
+            clamped = Some(sc);
+            // 보이는 높이만큼만 그린다 — 1만 줄짜리 새 파일도 매 프레임 전부 만들지 않게.
+            let skip = (sc as usize).saturating_sub(body.len());
+            body = body.into_iter().skip(sc as usize).collect();
+            let room = height.saturating_sub(body.len());
+            body.extend(plan.into_iter().skip(skip).take(room).map(|o| match o {
                 Some(j) => row_line(&rows[j], bgs, None, false),
                 None => sep_line(),
             }));
-            if body.is_empty() {
+            if total == 0 {
                 body.push(Line::from("(diff 없음)"));
             }
             let (_, tail) = commit_mark(app, i);
@@ -253,8 +263,11 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
     };
     let diff = Paragraph::new(body)
         .block(Block::default().borders(Borders::ALL).title(truncate_left(&title, title_width)))
-        .scroll((app.scroll, app.hscroll));
+        .scroll((0, app.hscroll));
     f.render_widget(diff, right);
+    if let Some(sc) = clamped {
+        app.scroll = sc;
+    }
 }
 
 fn draw_file(f: &mut Frame, app: &mut App, area: Rect) {
@@ -263,31 +276,31 @@ fn draw_file(f: &mut Frame, app: &mut App, area: Rect) {
     app.diff_area = area;
     let height = area.height.saturating_sub(2) as usize;
 
+    // 그릴 줄 계획(줄 번호, 보일 글자 수, 커서)만 먼저 세우고, 화면에 보이는 높이만큼만 실제로 그린다.
     let (lines, focus, first_change) = {
         let fv = app.file.as_ref().expect("file view");
         let rows = &app.rows[&idx];
-        let bgs = app.hl.diff_bgs();
-        let mut lines = Vec::new();
+        let mut lines: Vec<(usize, Option<usize>, bool)> = Vec::new();
         let mut focus = None;
         let mut first_change = None;
         match &fv.replay {
             None => {
-                for r in rows {
+                for (i, r) in rows.iter().enumerate() {
                     if r.is_change() && first_change.is_none() {
                         first_change = Some(lines.len());
                     }
-                    lines.push(row_line(r, bgs, None, false));
+                    lines.push((i, None, false));
                 }
             }
             Some(rp) => {
                 let mut budget = rp.typed;
                 let mut typing_done = false;
-                for r in rows {
+                for (i, r) in rows.iter().enumerate() {
                     match (rp.phase, r.kind) {
                         (Phase::Delete, RowKind::Add) => {}
                         (Phase::Delete, RowKind::Del) => {
                             focus.get_or_insert(lines.len());
-                            lines.push(row_line(r, bgs, None, false));
+                            lines.push((i, None, false));
                         }
                         (_, RowKind::Del) => {}
                         (Phase::Type, RowKind::Add) => {
@@ -297,18 +310,18 @@ fn draw_file(f: &mut Frame, app: &mut App, area: Rect) {
                             let w = r.width();
                             if budget > w {
                                 budget -= w + 1;
-                                lines.push(row_line(r, bgs, None, false));
+                                lines.push((i, None, false));
                             } else {
                                 focus = Some(lines.len());
-                                lines.push(row_line(r, bgs, Some(budget), true));
+                                lines.push((i, Some(budget), true));
                                 typing_done = true;
                             }
                         }
                         (Phase::Hold, RowKind::Add) => {
                             focus.get_or_insert(lines.len());
-                            lines.push(row_line(r, bgs, None, false));
+                            lines.push((i, None, false));
                         }
-                        _ => lines.push(row_line(r, bgs, None, false)),
+                        _ => lines.push((i, None, false)),
                     }
                 }
             }
@@ -328,6 +341,14 @@ fn draw_file(f: &mut Frame, app: &mut App, area: Rect) {
     }
     fv.scroll = fv.scroll.min(max_scroll);
     let (scroll, pos, n) = (fv.scroll, fv.pos, fv.seq.len());
+    let rows = &app.rows[&idx];
+    let bgs = app.hl.diff_bgs();
+    let lines: Vec<Line> = lines
+        .iter()
+        .skip(scroll as usize)
+        .take(height)
+        .map(|&(i, reveal, cursor)| row_line(&rows[i], bgs, reveal, cursor))
+        .collect();
 
     let e = app.entry(idx);
     let title_width = (area.width as usize).saturating_sub(4);
@@ -337,6 +358,6 @@ fn draw_file(f: &mut Frame, app: &mut App, area: Rect) {
     let title = format!("{head}{}{tail} ", truncate_left(&e.rel_path(), room));
     let view = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((scroll, app.hscroll));
+        .scroll((0, app.hscroll));
     f.render_widget(view, area);
 }

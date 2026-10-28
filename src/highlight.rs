@@ -68,8 +68,13 @@ impl Highlighter {
         }
     }
 
-    fn theme(&self) -> &Theme {
-        if self.light { &self.light_themes[self.cur_light] } else { &self.dark[self.cur_dark] }
+    /// 지금 고른 테마: (라이트인가, 목록 안 번호). 백그라운드 하이라이트에 넘긴다.
+    pub fn selection(&self) -> (bool, usize) {
+        if self.light { (true, self.cur_light) } else { (false, self.cur_dark) }
+    }
+
+    fn theme_of(&self, (light, i): (bool, usize)) -> &Theme {
+        if light { &self.light_themes[i] } else { &self.dark[i] }
     }
 
     pub fn theme_name(&self) -> &'static str {
@@ -114,7 +119,11 @@ impl Highlighter {
 
     /// 줄들을 처음부터 이어서 칠한다 — 여러 줄 주석·문자열 상태가 줄 사이로 이어진다.
     pub fn highlight(&self, path: &Path, lines: &[String]) -> Vec<Spans> {
-        let mut h = HighlightLines::new(self.syntax_for(path), self.theme());
+        self.highlight_as(path, lines, self.selection())
+    }
+
+    pub fn highlight_as(&self, path: &Path, lines: &[String], sel: (bool, usize)) -> Vec<Spans> {
+        let mut h = HighlightLines::new(self.syntax_for(path), self.theme_of(sel));
         lines
             .iter()
             .map(|l| {

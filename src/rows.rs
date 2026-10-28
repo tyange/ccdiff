@@ -1,5 +1,7 @@
 //! 수정 하나를 "파일 전체 기준 줄 목록"으로 펼친다. 화면·재생이 모두 이 목록을 쓴다.
 
+use ratatui::style::Color;
+
 use crate::{
     highlight::{Highlighter, Spans},
     session::EditEntry,
@@ -22,6 +24,29 @@ pub struct Row {
     pub old_no: Option<usize>,
     pub new_no: Option<usize>,
     pub spans: Spans,
+    /// 색을 가져올 줄: (수정 전 파일인가, 줄 인덱스). 하이라이트가 끝나면 여기서 색을 채운다.
+    pub src: Option<(bool, usize)>,
+}
+
+/// 하이라이트할 원문: (수정 전 줄들, 수정 후 줄들).
+pub type Sources = (Vec<String>, Vec<String>);
+
+fn plain(text: &str) -> Spans {
+    if text.is_empty() { Vec::new() } else { vec![(Color::Reset, text.to_string())] }
+}
+
+/// 백그라운드에서 칠한 결과를 줄들에 입힌다.
+pub fn apply_highlight(rows: &mut [Row], before: &[Spans], after: &[Spans]) {
+    for r in rows {
+        let colored = match r.src {
+            Some((true, i)) => before.get(i),
+            Some((false, i)) => after.get(i),
+            None => None,
+        };
+        if let Some(c) = colored {
+            r.spans = c.clone();
+        }
+    }
 }
 
 impl Row {
@@ -47,11 +72,13 @@ fn push_ctx(bi: usize, text: String, after: &mut Vec<String>, plan: &mut Vec<Pla
     plan.push((RowKind::Ctx, Some(bi + 1), Some(after.len()), Src::After(after.len() - 1)));
 }
 
-pub fn build_rows(e: &EditEntry, hl: &Highlighter) -> Vec<Row> {
+/// 줄 목록은 바로 만들고(색 없음), 칠할 원문은 따로 돌려준다 — 하이라이트는 느려서 백그라운드로 보낸다.
+/// 원문이 None 이면 이미 칠해진 것이다(diff 조각만 있는 경우).
+pub fn build_rows(e: &EditEntry, hl: &Highlighter) -> (Vec<Row>, Option<Sources>) {
     let before: Vec<String> = match (&e.before, e.kind) {
         (Some(b), _) => b.lines().take(MAX_LINES).map(String::from).collect(),
         (None, "Write+") => Vec::new(),
-        (None, _) => return fragment_rows(e, hl),
+        (None, _) => return (fragment_rows(e, hl), None),
     };
 
     let mut after: Vec<String> = Vec::new();
@@ -105,19 +132,17 @@ pub fn build_rows(e: &EditEntry, hl: &Highlighter) -> Vec<Row> {
         }
     }
 
-    let hb = hl.highlight(&e.path, &before);
-    let ha = hl.highlight(&e.path, &after);
-    plan.into_iter()
-        .map(|(kind, old_no, new_no, src)| Row {
-            kind,
-            old_no,
-            new_no,
-            spans: match src {
-                Src::Before(i) => hb.get(i).cloned().unwrap_or_default(),
-                Src::After(i) => ha.get(i).cloned().unwrap_or_default(),
-            },
+    let rows = plan
+        .into_iter()
+        .map(|(kind, old_no, new_no, src)| {
+            let (spans, src) = match src {
+                Src::Before(i) => (plain(before.get(i).map(String::as_str).unwrap_or("")), (true, i)),
+                Src::After(i) => (plain(after.get(i).map(String::as_str).unwrap_or("")), (false, i)),
+            };
+            Row { kind, old_no, new_no, spans, src: Some(src) }
         })
-        .collect()
+        .collect();
+    (rows, Some((before, after)))
 }
 
 /// 수정 전 파일이 기록에 없을 때: diff 조각마다 따로 칠한다(조각 첫 줄에서 문법 상태가 끊길 수 있다).
@@ -125,7 +150,7 @@ fn fragment_rows(e: &EditEntry, hl: &Highlighter) -> Vec<Row> {
     let mut rows = Vec::new();
     for (n, h) in e.hunks.iter().enumerate() {
         if n > 0 {
-            rows.push(Row { kind: RowKind::Sep, old_no: None, new_no: None, spans: Vec::new() });
+            rows.push(Row { kind: RowKind::Sep, old_no: None, new_no: None, spans: Vec::new(), src: None });
         }
         let texts: Vec<String> = h.lines.iter().map(|l| l.chars().skip(1).collect()).collect();
         let colored = hl.highlight(&e.path, &texts);
@@ -147,7 +172,7 @@ fn fragment_rows(e: &EditEntry, hl: &Highlighter) -> Vec<Row> {
                     (RowKind::Ctx, Some(old - 1), Some(new - 1))
                 }
             };
-            rows.push(Row { kind, old_no: o, new_no: nn, spans });
+            rows.push(Row { kind, old_no: o, new_no: nn, spans, src: None });
         }
     }
     rows

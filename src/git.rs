@@ -68,6 +68,20 @@ fn read_log(root: &Path, since: i64) -> Option<Vec<Commit>> {
     Some(commits)
 }
 
+/// 커밋 판정에 필요한 것만 뽑은 것 — 백그라운드 스레드로 넘긴다.
+pub struct CommitQuery {
+    pub key: usize,
+    root: Option<PathBuf>,
+    rel: String,
+    path: PathBuf,
+    epoch: i64,
+    probe: Vec<String>,
+}
+
+pub fn query(key: usize, e: &EditEntry) -> CommitQuery {
+    CommitQuery { key, root: e.root.clone(), rel: e.rel_path(), path: e.path.clone(), epoch: e.epoch, probe: added_lines(e) }
+}
+
 fn added_lines(e: &EditEntry) -> Vec<String> {
     let mut out: Vec<String> = if e.hunks.is_empty() {
         e.content.as_deref().unwrap_or("").lines().map(String::from).collect()
@@ -91,7 +105,7 @@ impl GitIndex {
         self.logs.len() != before
     }
 
-    pub fn state(&mut self, e: &EditEntry, since: i64) -> CommitState {
+    pub fn state(&mut self, e: &CommitQuery, since: i64) -> CommitState {
         let Some(root) = &e.root else { return CommitState::Unknown };
         if !self.logs.contains_key(root) {
             match read_log(root, since) {
@@ -101,14 +115,14 @@ impl GitIndex {
                 None => return CommitState::Unknown,
             }
         }
-        let rel = e.rel_path();
+        let rel = &e.rel;
         let log = &self.logs[root];
-        let Some(c) = log.commits.iter().find(|c| c.time >= e.epoch && c.files.contains(&rel)) else {
+        let Some(c) = log.commits.iter().find(|c| c.time >= e.epoch && c.files.contains(rel)) else {
             return if e.path.exists() { CommitState::No } else { CommitState::Gone };
         };
         let hash = c.hash[..7.min(c.hash.len())].to_string();
         let subject = c.subject.clone();
-        let probe = added_lines(e);
+        let probe = &e.probe;
         if !probe.is_empty() {
             let blob = git(root, &["show", &format!("{}:{}", c.hash, rel)]).unwrap_or_default();
             let have: HashSet<&str> = blob.lines().map(str::trim_end).collect();
