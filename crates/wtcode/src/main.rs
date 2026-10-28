@@ -351,7 +351,8 @@ impl App {
                 self.todo.reload(true);
             }
             _ if self.focus == Focus::Todo => match k.code {
-                KeyCode::Char('p') => self.send_selected(false),
+                // 넣고 그 Claude 로 포커스를 옮긴다 — 이어서 다듬거나 Enter 로 보낸다.
+                KeyCode::Char('p') | KeyCode::Enter => self.send_selected(false),
                 KeyCode::Char('P') => self.send_selected(true),
                 KeyCode::Char('y') => {
                     if let Some(text) = self.selected_text() {
@@ -365,7 +366,8 @@ impl App {
                 KeyCode::PageUp => self.todo.scroll_by(-self.todo.page()),
                 KeyCode::Char('g') | KeyCode::Home => self.todo.scroll_by(isize::MIN / 2),
                 KeyCode::Char('G') | KeyCode::End => self.todo.scroll_by(isize::MAX / 2),
-                KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('x') => self.toggle_todo(),
+                // Enter 는 체크하지 않는다 — p 로 넣은 뒤 보내려고 누른 Enter 가 체크가 되는 일이 있었다.
+                KeyCode::Char(' ') | KeyCode::Char('x') => self.toggle_todo(),
                 KeyCode::Char('d') => {
                     if let Some(at) = self.todo.sel {
                         self.mode = Mode::Deleting(at, self.todo.lines[at].clone());
@@ -415,7 +417,13 @@ impl App {
             self.open_picker(Some((text.to_string(), submit)));
             return;
         };
-        let r = target::send(&t.id, text, submit).map(|_| format!("{} {}: {text}", t.label, if submit { "← 보냄" } else { "← 넣음" }));
+        let r = target::send(&t.id, text, submit).and_then(|_| {
+            if submit {
+                return Ok(format!("{} ← 보냄: {text}", t.label));
+            }
+            // 넣기만 했으면 키보드를 그 Claude 로 옮긴다 — 여기서 Enter 를 누르면 wtcode 로 가 버린다.
+            target::focus(&t.id).map(|_| format!("{} ← 넣고 그 창으로 옮김: {text}", t.label))
+        });
         self.say(r.unwrap_or_else(|e| e));
     }
 
@@ -564,7 +572,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         )),
         Mode::Normal => match &app.notice {
             Some((m, at)) if at.elapsed() < Duration::from_secs(4) => Line::from(Span::styled(format!(" {m}"), gray)),
-            _ if app.focus == Focus::Todo => Line::from(Span::styled(" space 체크 · p 세션에 넣기 · P 보내기 · y 복사 · t 세션 고르기 · a 추가 · d 지우기 · Tab", gray)),
+            _ if app.focus == Focus::Todo => Line::from(Span::styled(" space 체크 · Enter·p 세션에 넣고 이동 · P 바로 보내기 · y 복사 · t 세션 고르기 · a 추가 · d 지우기 · Tab", gray)),
             _ => Line::from(Span::styled(" ↑↓ 이동 · Enter·클릭 VS Code · Tab 투두 · a 투두 추가 · r 새로고침 · q 종료", gray)),
         },
     };

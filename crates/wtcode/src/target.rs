@@ -81,6 +81,15 @@ pub fn send(pane: &str, text: &str, submit: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 그 pane 으로 키보드 포커스를 옮긴다(다른 window 면 그 window 로, 다른 세션이면 그 세션으로).
+pub fn focus(pane: &str) -> Result<(), String> {
+    // 지금 이 클라이언트가 보는 세션과 다르면 세션부터 바꾼다.
+    tmux(&["switch-client", "-t", pane]);
+    tmux(&["select-window", "-t", pane]).ok_or("그 창으로 옮기지 못했다")?;
+    tmux(&["select-pane", "-t", pane]).ok_or("그 pane 으로 옮기지 못했다")?;
+    Ok(())
+}
+
 /// macOS 클립보드에 넣는다(⌘C 는 터미널이 먼저 가로채 앱이 받을 수 없다).
 pub fn copy(text: &str) -> Result<(), String> {
     let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn().map_err(|e| format!("pbcopy 실행 실패: {e}"))?;
