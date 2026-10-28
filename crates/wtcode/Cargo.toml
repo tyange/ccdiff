@@ -1,0 +1,9 @@
+[package]
+name = "wtcode"
+version = "0.1.0"
+edition = "2021"
+description = "레포의 git 워크트리 목록을 보이고, 고르면 VS Code 로 여는 터미널 도구"
+
+[dependencies]
+anyhow = "1"
+ratatui = "0.29"
