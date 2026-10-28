@@ -3,6 +3,7 @@
 pub mod git;
 pub mod ide;
 pub mod rows;
+pub mod secret;
 pub mod session;
 pub mod tracker;
 pub mod worktree;

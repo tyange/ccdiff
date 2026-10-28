@@ -4,7 +4,7 @@
 
 use std::{
     env, fs,
-    io::{ErrorKind, Read},
+    io::ErrorKind,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
@@ -22,6 +22,8 @@ use tungstenite::{
     Message,
 };
 
+use crate::secret::random_token;
+
 /// 연결마다 (번호, 보낼 통로). 연결이 끊기면 그 스레드가 자기 번호를 지운다.
 type Clients = Arc<Mutex<Vec<(u64, Sender<String>)>>>;
 
@@ -33,12 +35,6 @@ pub struct Ide {
     clients: Clients,
     /// 새로 붙은 쪽에 곧바로 보낼 마지막 선택.
     last: Arc<Mutex<Option<String>>>,
-}
-
-fn random_token() -> Option<String> {
-    let mut buf = [0u8; 16];
-    fs::File::open("/dev/urandom").ok()?.read_exact(&mut buf).ok()?;
-    Some(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn alive(pid: u64) -> bool {

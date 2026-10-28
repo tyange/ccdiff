@@ -8,7 +8,10 @@ use std::{
     time::SystemTime,
 };
 
-use crate::session::{fmt_epoch, EditEntry, Hunk};
+use crate::{
+    secret::is_secret,
+    session::{fmt_epoch, EditEntry, Hunk},
+};
 
 const MAX_UNTRACKED: usize = 30;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -16,18 +19,6 @@ const MAX_FILE_BYTES: u64 = 256 * 1024;
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git").arg("-C").arg(root).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// 자격증명·토큰류는 화면에 내용을 띄우지 않는다.
-fn is_secret(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    name.starts_with(".env")
-        || name == ".auth"
-        || rel.contains("/.auth")
-        || rel.starts_with(".auth")
-        || name.contains("credential")
-        || name == "token.json"
-        || [".pem", ".key", ".p12"].iter().any(|x| name.ends_with(x))
 }
 
 fn mtime(path: &Path) -> i64 {
