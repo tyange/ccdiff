@@ -131,7 +131,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_list(f, app, main);
         let follow = if app.follow { "따라가기 켜짐" } else { "따라가기 꺼짐" };
         format!(
-            " {follow} · {theme} │ Enter 파일 보기 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · c 커밋 필터 · a 세션 전 변경 · h git 밖 · t 테마 · b 밝기 · q 종료"
+            " {follow} · {theme} │ Enter 파일 보기·그룹 접기 · z/Z 그룹 접기/전부 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · c 커밋 필터 · a 세션 전 변경 · h git 밖 · t 테마 · b 밝기 · q 종료"
         )
     };
     f.render_widget(Paragraph::new(text).style(gray()), status);
@@ -160,11 +160,12 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
         .map(|d| {
             let i = match d {
                 Disp::Item(k) => *k,
-                Disp::Header { key, count } => {
+                Disp::Header { key, count, collapsed } => {
                     let e = app.entry(*key);
                     let path = e.root.as_ref().map(|r| r.display().to_string()).unwrap_or_else(|| "(git 밖)".into());
+                    let arrow = if *collapsed { "▸" } else { "▾" };
                     return ListItem::new(Line::from(vec![
-                        Span::styled(format!("━━ {} ", e.label()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{arrow} {} ", e.label()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                         Span::styled(format!("{count}건 · {path}"), gray()),
                     ]));
                 }
@@ -233,6 +234,10 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
             let room = title_width.saturating_sub(head.chars().count() + tail.chars().count() + 1);
             (format!("{head}{}{tail} ", truncate_left(&e.rel_path(), room)), body)
         }
+        None if app.on_header() => (
+            format!(" {} ", app.session),
+            vec![Line::from(Span::styled("워크트리 머리줄 — Enter·space·클릭으로 접기/펴기, Z 로 전부", gray()))],
+        ),
         None => (format!(" {} ", app.session), vec![Line::from("아직 수정이 없다")]),
     };
     let diff = Paragraph::new(body)

@@ -7,7 +7,7 @@ mod ui;
 mod worktree;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -39,7 +39,7 @@ const WT_REFRESH: Duration = Duration::from_secs(10);
 
 /// 목록의 한 줄: 워크트리 머리줄(선택 안 됨) 또는 항목.
 pub enum Disp {
-    Header { key: usize, count: usize },
+    Header { key: usize, count: usize, collapsed: bool },
     Item(usize),
 }
 
@@ -82,6 +82,8 @@ pub struct App {
     /// 세션 첫 기록 시각. 그 전부터 있던 작업 트리 변경은 기본으로 숨긴다.
     session_start: i64,
     pub show_old_wt: bool,
+    /// 접힌 워크트리 그룹.
+    collapsed: HashSet<Option<PathBuf>>,
 }
 
 impl App {
@@ -232,11 +234,52 @@ impl App {
         }
         groups.sort_by_key(|g| g.1.iter().map(|&k| self.entry(k).epoch).max());
         let mut out = Vec::new();
-        for (_, keys) in groups {
-            out.push(Disp::Header { key: keys[0], count: keys.len() });
-            out.extend(keys.into_iter().map(Disp::Item));
+        for (root, keys) in groups {
+            let collapsed = self.collapsed.contains(&root);
+            out.push(Disp::Header { key: keys[0], count: keys.len(), collapsed });
+            if !collapsed {
+                out.extend(keys.into_iter().map(Disp::Item));
+            }
         }
         out
+    }
+
+    /// 선택한 줄이 속한 그룹을 접거나 펴고, 그 그룹 머리줄을 선택한다.
+    fn toggle_group(&mut self) {
+        let d = self.display();
+        let Some(key) = self.list.selected().and_then(|s| d.get(s)).map(|x| match x {
+            Disp::Header { key, .. } | Disp::Item(key) => *key,
+        }) else {
+            return;
+        };
+        let root = self.entry(key).root.clone();
+        if !self.collapsed.remove(&root) {
+            self.collapsed.insert(root.clone());
+        }
+        let d = self.display();
+        let at = d.iter().position(|x| matches!(x, Disp::Header { key, .. } if self.entry(*key).root == root));
+        // 목록 길이가 바뀌므로 스크롤 위치를 처음부터 다시 잡게 한다(선택 줄은 그리기 때 보이게 맞춰진다).
+        *self.list.offset_mut() = 0;
+        self.list.select(at);
+        self.follow = false;
+        self.scroll = 0;
+    }
+
+    fn toggle_all_groups(&mut self) {
+        let roots: HashSet<Option<PathBuf>> = self.visible().into_iter().map(|k| self.entry(k).root.clone()).collect();
+        if roots.iter().any(|r| !self.collapsed.contains(r)) {
+            self.collapsed = roots;
+        } else {
+            self.collapsed.clear();
+        }
+        *self.list.offset_mut() = 0;
+        self.follow = true;
+        self.select_last();
+    }
+
+    pub fn on_header(&self) -> bool {
+        let d = self.display();
+        matches!(self.list.selected().and_then(|s| d.get(s)), Some(Disp::Header { .. }))
     }
 
     pub fn selected_entry(&self) -> Option<usize> {
@@ -246,34 +289,21 @@ impl App {
         }
     }
 
-    fn last_item(d: &[Disp]) -> Option<usize> {
-        d.iter().rposition(|x| matches!(x, Disp::Item(_)))
-    }
-
     fn select_last(&mut self) {
-        let d = self.display();
-        self.list.select(Self::last_item(&d));
+        let n = self.display().len();
+        self.list.select(n.checked_sub(1));
         self.scroll = 0;
     }
 
-    /// 머리줄을 건너뛰며 delta 칸 움직인다.
     fn move_by(&mut self, delta: isize) {
-        let d = self.display();
-        let Some(last) = Self::last_item(&d) else { return };
-        let mut cur = self.list.selected().filter(|&s| s < d.len()).unwrap_or(last) as isize;
-        let step = delta.signum();
-        for _ in 0..delta.unsigned_abs().min(d.len()) {
-            let mut j = cur + step;
-            while j >= 0 && (j as usize) < d.len() && matches!(d[j as usize], Disp::Header { .. }) {
-                j += step;
-            }
-            if j < 0 || j as usize >= d.len() {
-                break;
-            }
-            cur = j;
+        let n = self.display().len();
+        if n == 0 {
+            return;
         }
-        self.list.select(Some(cur as usize));
-        self.follow = cur as usize == last;
+        let cur = self.list.selected().unwrap_or(n - 1) as isize;
+        let next = (cur + delta).clamp(0, n as isize - 1) as usize;
+        self.list.select(Some(next));
+        self.follow = next == n - 1;
         self.scroll = 0;
     }
 
@@ -371,10 +401,13 @@ impl App {
             MouseEventKind::Down(_) if in_list && m.row > self.list_area.y => {
                 let idx = self.list.offset() + (m.row - self.list_area.y - 1) as usize;
                 let d = self.display();
-                if matches!(d.get(idx), Some(Disp::Item(_))) {
+                if idx < d.len() {
                     self.list.select(Some(idx));
-                    self.follow = Some(idx) == Self::last_item(&d);
+                    self.follow = idx == d.len() - 1;
                     self.scroll = 0;
+                    if matches!(d[idx], Disp::Header { .. }) {
+                        self.toggle_group();
+                    }
                 }
             }
             _ => {}
@@ -412,7 +445,10 @@ impl App {
         }
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Enter | KeyCode::Char('o') if self.on_header() => self.toggle_group(),
             KeyCode::Enter | KeyCode::Char('o') => self.open_file(),
+            KeyCode::Char(' ') | KeyCode::Char('z') => self.toggle_group(),
+            KeyCode::Char('Z') => self.toggle_all_groups(),
             KeyCode::Char('d') if ctrl => self.scroll = self.scroll.saturating_add(20),
             KeyCode::Char('u') if ctrl => self.scroll = self.scroll.saturating_sub(20),
             KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
@@ -604,6 +640,7 @@ fn main() -> Result<()> {
         wt_at: None,
         session_start: 0,
         show_old_wt: false,
+        collapsed: HashSet::new(),
     };
     app.ingest()?;
     app.refresh_commits();
