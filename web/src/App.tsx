@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { subscribe, type Conn } from "./api";
 import { Changes, type ChangesHandle } from "./Changes";
 import { ImportDialog, NewSessionDialog } from "./Dialogs";
+import { Servers } from "./Servers";
 import { SessionList } from "./SessionList";
 import { Terminal, type TerminalHandle } from "./Terminal";
 import type { Session } from "./types";
@@ -169,7 +170,7 @@ export function App() {
         "변경",
         <Changes ref={changes} session={current} focusTerminal={() => terminal.current?.focus()} />,
       )}
-      {panel("servers", "서버", <p className="empty">다음 단계: dev 서버 로그</p>)}
+      {panel("servers", "서버", <Servers session={current} />)}
       {importing && (
         <ImportDialog
           session={importing}

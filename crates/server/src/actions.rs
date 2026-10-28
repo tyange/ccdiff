@@ -26,11 +26,19 @@ pub struct ImportPlan {
     name: String,
 }
 
-#[derive(Default)]
-pub struct Plans(Mutex<HashMap<String, (ImportPlan, Instant)>>);
+/// 확인을 거친 동작의 일회용 nonce → 계획. 2분 뒤 만료되고 한 번만 쓸 수 있다.
+pub struct Nonces<T>(Mutex<HashMap<String, (T, Instant)>>);
 
-impl Plans {
-    fn put(&self, plan: ImportPlan) -> Option<String> {
+impl<T> Default for Nonces<T> {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+}
+
+pub type Plans = Nonces<ImportPlan>;
+
+impl<T> Nonces<T> {
+    pub fn put(&self, plan: T) -> Option<String> {
         let nonce = random_token()?;
         let mut m = self.0.lock().ok()?;
         m.retain(|_, (_, at)| at.elapsed() < PLAN_TTL);
@@ -39,7 +47,7 @@ impl Plans {
     }
 
     /// 한 번만 쓸 수 있다.
-    fn take(&self, nonce: &str) -> Option<ImportPlan> {
+    pub fn take(&self, nonce: &str) -> Option<T> {
         let (plan, at) = self.0.lock().ok()?.remove(nonce)?;
         (at.elapsed() < PLAN_TTL).then_some(plan)
     }

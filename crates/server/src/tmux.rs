@@ -13,8 +13,9 @@ pub struct Pane {
     /// pane 에서 지금 도는 명령. Claude 는 프로세스 이름이 버전 문자열(예: 2.1.312)로 보인다.
     pub command: String,
     pub path: PathBuf,
-    /// tmux-orch.sh 가 붙이는 pane 옵션.
+    /// tmux-orch.sh 가 붙이는 pane 옵션(agent 는 Claude, server 는 dev 서버 pane).
     pub agent: String,
+    pub server: String,
     pub agent_status: String,
     pub width: u16,
     pub height: u16,
@@ -36,6 +37,7 @@ const FIELDS: &[&str] = &[
     "pane_current_path",
     "@agent",
     "@agent_status",
+    "@server",
     "pane_width",
     "pane_height",
 ];
@@ -122,7 +124,8 @@ fn parse_pane(line: &str) -> Option<Pane> {
         path: PathBuf::from(f[7]),
         agent: f[8].into(),
         agent_status: f[9].into(),
-        width: f[10].parse().unwrap_or(0),
-        height: f[11].parse().unwrap_or(0),
+        server: f[10].into(),
+        width: f[11].parse().unwrap_or(0),
+        height: f[12].parse().unwrap_or(0),
     })
 }

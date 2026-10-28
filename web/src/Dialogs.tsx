@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { getJson, postJson } from "./api";
 import type { Session } from "./types";
 
-function Modal(props: { title: string; onClose: () => void; children: React.ReactNode }) {
+export function Modal(props: { title: string; onClose: () => void; children: React.ReactNode }) {
   const { onClose } = props;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

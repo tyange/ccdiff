@@ -5,6 +5,7 @@ use std::{collections::HashMap, process::Command};
 #[derive(Default)]
 pub struct Procs {
     children: HashMap<u32, Vec<u32>>,
+    parents: HashMap<u32, u32>,
     commands: HashMap<u32, String>,
     /// 시작 시각(UTC, `Wed Oct 28 04:35:22 2026` 꼴, 공백 하나로 맞춤).
     starts: HashMap<u32, String>,
@@ -21,6 +22,7 @@ impl Procs {
                 continue;
             };
             p.children.entry(ppid).or_default().push(pid);
+            p.parents.insert(pid, ppid);
             let start: Vec<&str> = it.by_ref().take(5).collect();
             p.starts.insert(pid, start.join(" "));
             p.commands.insert(pid, it.collect::<Vec<_>>().join(" "));
@@ -41,6 +43,25 @@ impl Procs {
 
     pub fn command(&self, pid: u32) -> Option<&str> {
         self.commands.get(&pid).map(String::as_str)
+    }
+
+    /// 바로 아래 프로세스들.
+    pub fn children(&self, pid: u32) -> &[u32] {
+        self.children.get(&pid).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// 부모, 그 부모… 순서로(init 전까지).
+    pub fn ancestors(&self, pid: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut cur = pid;
+        while let Some(&p) = self.parents.get(&cur) {
+            if p <= 1 || out.contains(&p) {
+                break;
+            }
+            out.push(p);
+            cur = p;
+        }
+        out
     }
 
     /// root 와 그 아래 프로세스들, 얕은 것부터.

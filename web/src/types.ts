@@ -84,3 +84,18 @@ export interface DiffInfo {
 export type DiffResult =
   | { secret: true; info: DiffInfo }
   | { secret: false; info: DiffInfo; original: string; modified: string; partial: boolean; firstChange: number | null };
+
+export interface DevServer {
+  /** pane 서버는 pane ID, pane 밖 서버는 pid:<N> */
+  id: string;
+  kind: "pane" | "detached";
+  name: string;
+  pane: { id: string; session: string; window: string } | null;
+  running: boolean;
+  command: string;
+  ports: number[];
+  worktree: { root: string; name: string | null; issue: number | null } | null;
+  /** pane 밖 서버를 띄운 Claude 세션 */
+  owner: string | null;
+  restartable: boolean;
+}

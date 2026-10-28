@@ -9,6 +9,7 @@ mod guard;
 mod procs;
 mod pty;
 mod registry;
+mod servers;
 mod term;
 mod tmux;
 
@@ -108,6 +109,61 @@ pub struct AppState {
     tmux: Tmux,
     plans: Arc<actions::Plans>,
     keys: Arc<term::KeySender>,
+    remembered: Arc<servers::Remembered>,
+    restarts: Arc<servers::RestartPlans>,
+}
+
+/// 레지스트리에서 서버 짝짓기에 쓸 것만 잠깐 잠가 복사한다.
+fn known(st: &AppState) -> Result<servers::Known, String> {
+    Ok(servers::Known::from(&*st.reg.lock().map_err(|_| "잠금 실패")?))
+}
+
+async fn servers_list(State(st): State<AppState>) -> Response {
+    blocking(move || Ok(Value::Array(servers::list(&st.tmux, &known(&st)?, &st.remembered)))).await
+}
+
+/// 재시작 계획: {"pane"} → 다시 칠 명령·경고·nonce.
+async fn restart_plan(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    let pane = field(&body, "pane");
+    blocking(move || servers::plan_restart(&st.tmux, &known(&st)?, &st.remembered, &st.restarts, &pane)).await
+}
+
+/// 확인한 재시작 실행: {"nonce"}.
+async fn restart(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    let nonce = field(&body, "nonce");
+    blocking(move || servers::restart(&st.tmux, &st.restarts, &nonce)).await
+}
+
+/// 서버 pane 로그: 1초마다 읽어 바뀌었을 때만 {"type":"log","text"} 를 보낸다. 시크릿은 서버에서 가린다.
+async fn log_ws(State(st): State<AppState>, axum::extract::Path(pane): axum::extract::Path<String>, ws: WebSocketUpgrade) -> Response {
+    let tmux = st.tmux.clone();
+    let p = pane.clone();
+    let ok = tokio::task::spawn_blocking(move || tmux.pane(&p).is_some_and(|p| servers::is_server_pane(&p))).await.unwrap_or(false);
+    if !ok {
+        return (StatusCode::NOT_FOUND, "서버 pane 이 아니다").into_response();
+    }
+    ws.protocols([WS_PROTOCOL]).on_upgrade(move |s| serve_log(s, st.tmux, pane))
+}
+
+async fn serve_log(mut s: WebSocket, tmux: Tmux, pane: String) {
+    let mut last = String::new();
+    loop {
+        let (t, p) = (tmux.clone(), pane.clone());
+        let Ok(Some(text)) = tokio::task::spawn_blocking(move || servers::log(&t, &p)).await else {
+            let _ = s.send(Message::Text(json!({"type": "gone"}).to_string().into())).await;
+            return;
+        };
+        if text != last {
+            if s.send(Message::Text(json!({"type": "log", "text": text}).to_string().into())).await.is_err() {
+                return;
+            }
+            last = text;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+            m = s.recv() => if matches!(m, Some(Ok(Message::Close(_))) | None | Some(Err(_))) { return },
+        }
+    }
 }
 
 /// 막히는 tmux·git 호출을 돌리고 결과를 JSON 으로. 실패는 409 와 이유.
@@ -372,6 +428,10 @@ async fn main() -> Result<()> {
         .route("/api/diff", post(changes_diff))
         .route("/api/open", post(open_editor))
         .route("/api/selection", post(selection))
+        .route("/api/servers", get(servers_list))
+        .route("/api/servers/restart/plan", post(restart_plan))
+        .route("/api/servers/restart", post(restart))
+        .route("/ws/log/{pane}", get(log_ws))
         .route("/ws/events", get(events))
         .route("/ws/term/{pane}", get(term::handle))
         .fallback(static_file)
@@ -382,6 +442,8 @@ async fn main() -> Result<()> {
             keys: Arc::new(term::KeySender::new(tmux.clone())),
             tmux,
             plans: Arc::default(),
+            remembered: Arc::default(),
+            restarts: Arc::default(),
         })
         .layer(middleware::from_fn_with_state(guard, guard::layer));
 
