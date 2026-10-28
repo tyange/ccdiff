@@ -1,0 +1,12 @@
+[package]
+name = "worktable"
+version = "0.1.0"
+edition = "2021"
+description = "Claude Code 세션·워크트리·dev 서버를 한 화면에서 다루는 로컬 웹 앱 서버"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "=0.8.9", features = ["ws"] }
+ccdiff-core = { path = "../core" }
+serde_json = "=1.0.154"
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net"] }
