@@ -17,6 +17,8 @@ pub struct Hunk {
 
 pub struct EditEntry {
     pub time: String,
+    /// 수정 시각(유닉스 초). 커밋 판정에 쓴다.
+    pub epoch: i64,
     pub kind: &'static str,
     pub path: PathBuf,
     pub root: Option<PathBuf>,
@@ -116,6 +118,10 @@ fn git_root(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+fn epoch(ts: Option<&str>) -> i64 {
+    ts.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|d| d.timestamp()).unwrap_or(0)
+}
+
 fn local_time(ts: Option<&str>) -> String {
     ts.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
@@ -184,6 +190,7 @@ pub fn parse_entry(line: &str, roots: &mut HashMap<PathBuf, Option<PathBuf>>) ->
 
     Some(EditEntry {
         time: local_time(v.get("timestamp").and_then(Value::as_str)),
+        epoch: epoch(v.get("timestamp").and_then(Value::as_str)),
         kind,
         path,
         root,

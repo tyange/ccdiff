@@ -1,3 +1,4 @@
+mod git;
 mod highlight;
 mod replay;
 mod rows;
@@ -25,6 +26,7 @@ use ratatui::{
     DefaultTerminal,
 };
 
+use git::{CommitState, GitIndex};
 use highlight::Highlighter;
 use replay::{Replay, Step};
 use rows::{build_rows, Row, RowKind};
@@ -58,6 +60,10 @@ pub struct App {
     pub hl: Highlighter,
     pub rows: HashMap<usize, Vec<Row>>,
     pub file: Option<FileView>,
+    git: GitIndex,
+    pub commits: HashMap<usize, CommitState>,
+    /// 0 전체 · 1 미커밋만 · 2 커밋만
+    commit_filter: u8,
 }
 
 impl App {
@@ -95,7 +101,48 @@ impl App {
         (0..self.entries.len())
             .filter(|&i| want.is_none_or(|r| &self.entries[i].root == r))
             .filter(|&i| !self.hide_outside || self.entries[i].root.is_some())
+            .filter(|&i| match self.commit_filter {
+                1 => !self.is_committed(i),
+                2 => self.is_committed(i),
+                _ => true,
+            })
             .collect()
+    }
+
+    pub fn is_committed(&self, i: usize) -> bool {
+        matches!(self.commits.get(&i), Some(CommitState::Yes { .. } | CommitState::Changed { .. } | CommitState::Gone))
+    }
+
+    pub fn uncommitted_count(&self) -> usize {
+        (0..self.entries.len())
+            .filter(|&i| self.entries[i].root.is_some() && matches!(self.commits.get(&i), Some(CommitState::No)))
+            .count()
+    }
+
+    pub fn commit_filter_label(&self) -> &'static str {
+        match self.commit_filter {
+            1 => "미커밋만",
+            2 => "커밋만",
+            _ => "",
+        }
+    }
+
+    /// 판정이 안 됐거나 아직 미커밋인 수정만 다시 본다 — 커밋됨은 바뀌지 않는다.
+    fn refresh_commits(&mut self) {
+        let expired = self.git.expire();
+        let since = self.entries.iter().map(|e| e.epoch).filter(|&t| t > 0).min().unwrap_or(0) - 60;
+        for i in 0..self.entries.len() {
+            let known = self.commits.get(&i);
+            let recheck = match known {
+                None => true,
+                Some(CommitState::Yes { .. } | CommitState::Changed { .. }) => false,
+                Some(_) => expired,
+            };
+            if recheck {
+                let st = self.git.state(&self.entries[i], since);
+                self.commits.insert(i, st);
+            }
+        }
     }
 
     fn selected_entry(&self) -> Option<usize> {
@@ -277,6 +324,11 @@ impl App {
                 }
             }
             KeyCode::Char('w') => self.cycle_filter(),
+            KeyCode::Char('c') => {
+                self.commit_filter = (self.commit_filter + 1) % 3;
+                self.follow = true;
+                self.select_last();
+            }
             KeyCode::Char('h') => {
                 self.hide_outside = !self.hide_outside;
                 self.follow = true;
@@ -334,6 +386,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             }
         }
         app.tick_replay();
+        // git 호출이 화면을 잠깐 멈추게 하므로 재생 중에는 미룬다.
+        if !app.replaying() {
+            app.refresh_commits();
+        }
         terminal.draw(|f| ui::draw(f, app))?;
         let wait = if app.replaying() { 30 } else { 300 };
         if event::poll(Duration::from_millis(wait))? {
@@ -422,8 +478,12 @@ fn main() -> Result<()> {
         hl: Highlighter::new(),
         rows: HashMap::new(),
         file: None,
+        git: GitIndex::default(),
+        commits: HashMap::new(),
+        commit_filter: 0,
     };
     app.ingest()?;
+    app.refresh_commits();
     app.select_last();
 
     // 되살린 "수정 후 파일" 이 같은 파일의 다음 수정의 "수정 전 파일" 과 같은지 본다.
@@ -452,8 +512,15 @@ fn main() -> Result<()> {
     }
 
     if list_only {
-        for e in app.visible().into_iter().map(|i| &app.entries[i]) {
-            println!("{} {:<9} +{:<4} -{:<4} {}", e.time, e.kind, e.added, e.removed, e.short_path());
+        for (i, e) in app.visible().into_iter().map(|i| (i, &app.entries[i])) {
+            let c = match app.commits.get(&i) {
+                Some(CommitState::Yes { hash, .. }) => format!("✓ {hash}"),
+                Some(CommitState::No) => "● 미커밋".into(),
+                Some(CommitState::Changed { hash, .. }) => format!("◐ {hash}"),
+                Some(CommitState::Gone) => "✗ 없음".into(),
+                _ => "?".into(),
+            };
+            println!("{} {:<9} +{:<4} -{:<4} {:<10} {}", e.time, e.kind, e.added, e.removed, c, e.short_path());
         }
         return Ok(());
     }

@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::{
+    git::CommitState,
     replay::Phase,
     rows::{compact, Row, RowKind},
     App,
@@ -65,6 +66,26 @@ fn row_line(r: &Row, bgs: (Color, Color), reveal: Option<usize>, cursor: bool) -
     Line::from(spans)
 }
 
+/// 목록 줄 앞 표시와 제목 꼬리.
+fn commit_mark(st: Option<&CommitState>) -> (Span<'static>, String) {
+    match st {
+        Some(CommitState::Yes { hash, subject }) => (
+            Span::styled("✓ ", Style::default().fg(Color::Green)),
+            format!(" · ✓ {hash} {subject}"),
+        ),
+        Some(CommitState::Changed { hash, subject }) => (
+            Span::styled("◐ ", Style::default().fg(Color::Cyan)),
+            format!(" · ◐ {hash} {subject} (커밋 전에 더 고침)"),
+        ),
+        Some(CommitState::Gone) => (Span::styled("✗ ", gray()), " · ✗ 커밋 없이 지워진 파일".to_string()),
+        Some(CommitState::No) => (
+            Span::styled("● ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            " · ● 미커밋".to_string(),
+        ),
+        _ => (Span::raw("  "), String::new()),
+    }
+}
+
 fn truncate_left(s: &str, width: usize) -> String {
     let n = s.chars().count();
     if n <= width || width < 2 {
@@ -91,7 +112,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_list(f, app, main);
         let follow = if app.follow { "따라가기 켜짐" } else { "따라가기 꺼짐" };
         format!(
-            " {follow} · {theme} │ Enter 파일 보기 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · h git 밖 · t 테마 · b 밝기 · q 종료"
+            " {follow} · {theme} │ Enter 파일 보기 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · c 커밋 필터 · h git 밖 · t 테마 · b 밝기 · q 종료"
         )
     };
     f.render_widget(Paragraph::new(text).style(gray()), status);
@@ -109,7 +130,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
     let today = chrono::Local::now().date_naive();
     let md = |d: chrono::NaiveDate| d.format("%m-%d").to_string();
     let (today_md, yday_md) = (md(today), today.pred_opt().map(md).unwrap_or_default());
-    let name_width = (left.width as usize).saturating_sub(42);
+    let name_width = (left.width as usize).saturating_sub(44);
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&i| {
@@ -124,23 +145,27 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
             } else {
                 (day.to_string(), gray())
             };
+            let (mark, _) = commit_mark(app.commits.get(&i));
+            // 커밋된 수정은 흐리게 — 아직 리뷰할 게 남은 미커밋 쪽으로 눈이 가게 한다.
+            let dim = if app.is_committed(i) { gray() } else { Style::default() };
             ListItem::new(Line::from(vec![
+                mark,
                 Span::styled(format!("{day_label} "), day_style),
-                Span::raw(format!("{hm} ")),
-                Span::raw(format!("{:<7}", e.kind)),
+                Span::styled(format!("{hm} "), dim),
+                Span::styled(format!("{:<7}", e.kind), dim),
                 Span::styled(format!("+{:<4}", e.added), Style::default().fg(Color::Green)),
                 Span::styled(format!("-{:<4} ", e.removed), Style::default().fg(Color::Red)),
                 Span::styled(format!("{:<8} ", e.label()), Style::default().fg(Color::Yellow)),
-                Span::raw(truncate_left(&e.file_name(), name_width)),
+                Span::styled(truncate_left(&e.file_name(), name_width), dim),
             ]))
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " 수정 {}건 · {} ",
-            visible.len(),
-            app.filter_label()
-        )))
+        .block(Block::default().borders(Borders::ALL).title({
+            let cf = app.commit_filter_label();
+            let cf = if cf.is_empty() { String::new() } else { format!(" · {cf}") };
+            format!(" 수정 {}건 · {}{cf} · 미커밋 {} ", visible.len(), app.filter_label(), app.uncommitted_count())
+        }))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, left, &mut app.list);
@@ -169,9 +194,10 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
             if body.is_empty() {
                 body.push(Line::from("(diff 없음)"));
             }
+            let (_, tail) = commit_mark(app.commits.get(&i));
             let head = format!(" {} · {} · ", e.time, e.label());
-            let room = title_width.saturating_sub(head.chars().count() + 1);
-            (format!("{head}{} ", truncate_left(&e.rel_path(), room)), body)
+            let room = title_width.saturating_sub(head.chars().count() + tail.chars().count() + 1);
+            (format!("{head}{}{tail} ", truncate_left(&e.rel_path(), room)), body)
         }
         None => (format!(" {} ", app.session), vec![Line::from("아직 수정이 없다")]),
     };
@@ -255,9 +281,10 @@ fn draw_file(f: &mut Frame, app: &mut App, area: Rect) {
 
     let e = &app.entries[idx];
     let title_width = (area.width as usize).saturating_sub(4);
+    let (_, tail) = commit_mark(app.commits.get(&idx));
     let head = format!(" 수정 {}/{} · {} · {} · ", pos + 1, n, e.time, e.label());
-    let room = title_width.saturating_sub(head.chars().count() + 1);
-    let title = format!("{head}{} ", truncate_left(&e.rel_path(), room));
+    let room = title_width.saturating_sub(head.chars().count() + tail.chars().count() + 1);
+    let title = format!("{head}{}{tail} ", truncate_left(&e.rel_path(), room));
     let view = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
         .scroll((scroll, app.hscroll));
