@@ -318,15 +318,39 @@ fn truncate_left(s: &str, width: usize) -> String {
     format!("…{tail}")
 }
 
+const THEMES: &[(&str, EmbeddedThemeName)] = &[
+    ("Catppuccin Mocha", EmbeddedThemeName::CatppuccinMocha),
+    ("Dracula", EmbeddedThemeName::Dracula),
+    ("TwoDark", EmbeddedThemeName::TwoDark),
+    ("Monokai", EmbeddedThemeName::MonokaiExtended),
+    ("Gruvbox Dark", EmbeddedThemeName::GruvboxDark),
+    ("Nord", EmbeddedThemeName::Nord),
+    ("One Half Dark", EmbeddedThemeName::OneHalfDark),
+];
+
 struct Highlighter {
     syntaxes: SyntaxSet,
-    theme: Theme,
+    themes: Vec<Theme>,
+    current: usize,
 }
 
 impl Highlighter {
     fn new() -> Self {
-        let theme = two_face::theme::extra().get(EmbeddedThemeName::OneHalfDark).clone();
-        Self { syntaxes: two_face::syntax::extra_newlines(), theme }
+        let set = two_face::theme::extra();
+        let themes = THEMES.iter().map(|(_, t)| set.get(*t).clone()).collect();
+        Self { syntaxes: two_face::syntax::extra_newlines(), themes, current: 0 }
+    }
+
+    fn theme(&self) -> &Theme {
+        &self.themes[self.current]
+    }
+
+    fn theme_name(&self) -> &'static str {
+        THEMES[self.current].0
+    }
+
+    fn next_theme(&mut self) {
+        self.current = (self.current + 1) % self.themes.len();
     }
 
     fn syntax_for(&self, path: &Path) -> &SyntaxReference {
@@ -349,11 +373,11 @@ fn diff_lines(e: &EditEntry, hl: &Highlighter) -> Vec<Line<'static>> {
         out.push(Line::from("(diff 없음)"));
     }
     let gutter = Style::default().fg(Color::DarkGray);
-    let add_bg = Color::Rgb(22, 52, 34);
-    let del_bg = Color::Rgb(66, 28, 30);
+    let add_bg = Color::Rgb(30, 66, 44);
+    let del_bg = Color::Rgb(80, 34, 40);
     // hunk 는 파일 조각이라 문법 상태가 조각 사이에서 끊긴다 — 조각마다 새로 시작한다.
     for h in &e.hunks {
-        let mut hi = HighlightLines::new(hl.syntax_for(&e.path), &hl.theme);
+        let mut hi = HighlightLines::new(hl.syntax_for(&e.path), hl.theme());
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
             format!("@@ -{} +{} @@", h.old_start, h.new_start),
@@ -397,6 +421,11 @@ fn diff_lines(e: &EditEntry, hl: &Highlighter) -> Vec<Line<'static>> {
                     )
                 })),
                 Err(_) => spans.push(Span::styled(code.to_string(), with_bg(Style::default()))),
+            }
+            // 바뀐 줄은 배경을 줄 끝까지 칠해야 글자 길이와 상관없이 한눈에 보인다.
+            if bg.is_some() {
+                let used: usize = code.chars().count();
+                spans.push(Span::styled(" ".repeat(400usize.saturating_sub(used)), with_bg(Style::default())));
             }
             out.push(Line::from(spans));
         }
@@ -472,9 +501,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(diff, right);
 
     let follow = if app.follow { "따라가기 켜짐" } else { "따라가기 꺼짐" };
+    let theme = app.hl.theme_name();
     f.render_widget(
         Paragraph::new(format!(
-            " {follow} │ j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · h git 밖 · q 종료"
+            " {follow} · {theme} │ t 테마 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · h git 밖 · q 종료"
         ))
         .style(Style::default().fg(Color::DarkGray)),
         status,
@@ -522,6 +552,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                         }
                     }
                     KeyCode::Char('w') => app.cycle_filter(),
+                    KeyCode::Char('t') => {
+                        app.hl.next_theme();
+                        app.rendered.clear();
+                    }
                     KeyCode::Char('h') => {
                         app.hide_outside = !app.hide_outside;
                         app.follow = true;
