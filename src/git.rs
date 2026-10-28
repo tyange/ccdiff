@@ -1,6 +1,6 @@
 //! 세션의 수정이 커밋에 들어갔는지 판정한다.
 //!
-//! 수정 시각 이후에 그 파일을 건드린 첫 커밋을 찾고, 그 커밋의 파일 내용에 수정으로 추가된
+//! 수정 시각 이후 그 워크트리 HEAD 에서 그 파일을 건드린 첫 커밋을 찾고, 그 커밋의 파일 내용에 수정으로 추가된
 //! 줄이 전부 들어 있으면 "커밋됨" 으로 본다. 시각만 보면 되돌린 수정까지 커밋됨으로 잡힌다.
 
 use std::{
@@ -51,9 +51,9 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn read_log(root: &Path, since: i64) -> Option<Vec<Commit>> {
-    // 워크트리마다 브랜치가 다르고 squash 전 커밋도 봐야 해서 --all 로 읽는다.
+    // 그 워크트리 브랜치(HEAD)에서 닿는 커밋만 본다. --all 이면 다른 브랜치가 같은 파일을 고친 커밋을 잘못 잡는다.
     let since = format!("--since={since}");
-    let raw = git(root, &["log", "--all", &since, "--name-only", "--format=%x00%H%x09%ct%x09%s"])?;
+    let raw = git(root, &["log", "HEAD", &since, "--name-only", "--format=%x00%H%x09%ct%x09%s"])?;
     let mut commits = Vec::new();
     for chunk in raw.split('\0').filter(|c| !c.trim().is_empty()) {
         let mut lines = chunk.lines();

@@ -10,7 +10,7 @@ use crate::{
     git::CommitState,
     replay::Phase,
     rows::{compact, Row, RowKind},
-    App, WT,
+    App, Disp, WT,
 };
 
 /// 바뀐 줄 배경을 줄 끝까지 칠하려고 붙이는 공백 수.
@@ -149,14 +149,26 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
     let today = chrono::Local::now().date_naive();
     let md = |d: chrono::NaiveDate| d.format("%m-%d").to_string();
     let (today_md, yday_md) = (md(today), today.pred_opt().map(md).unwrap_or_default());
-    let name_width = (left.width as usize).saturating_sub(44);
+    let name_width = (left.width as usize).saturating_sub(35);
     let mut name_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for &i in &visible {
         *name_count.entry(app.entry(i).file_name()).or_default() += 1;
     }
-    let items: Vec<ListItem> = visible
+    let display = app.display();
+    let items: Vec<ListItem> = display
         .iter()
-        .map(|&i| {
+        .map(|d| {
+            let i = match d {
+                Disp::Item(k) => *k,
+                Disp::Header { key, count } => {
+                    let e = app.entry(*key);
+                    let path = e.root.as_ref().map(|r| r.display().to_string()).unwrap_or_else(|| "(git 밖)".into());
+                    return ListItem::new(Line::from(vec![
+                        Span::styled(format!("━━ {} ", e.label()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{count}건 · {path}"), gray()),
+                    ]));
+                }
+            };
             let e = app.entry(i);
             let hm = e.time.get(6..11).unwrap_or(&e.time);
             let day = e.time.get(0..5).unwrap_or("");
@@ -178,7 +190,6 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
                 Span::styled(format!("{:<7}", e.kind), dim),
                 Span::styled(format!("+{:<4}", e.added), Style::default().fg(Color::Green)),
                 Span::styled(format!("-{:<4} ", e.removed), Style::default().fg(Color::Red)),
-                Span::styled(format!("{:<8} ", e.label()), Style::default().fg(Color::Yellow)),
                 Span::styled(truncate_left(&display_name(e, &name_count), name_width), dim),
             ]))
         })
@@ -195,7 +206,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
     app.list_area = left;
     app.diff_area = right;
 
-    let sel = app.list.selected().and_then(|s| visible.get(s)).copied();
+    let sel = app.selected_entry();
     let title_width = (right.width as usize).saturating_sub(4);
     let (title, body) = match sel {
         Some(i) => {

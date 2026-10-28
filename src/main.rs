@@ -37,6 +37,12 @@ use session::{bash_roots, parse_entry, EditEntry, Tail};
 pub const WT: usize = 1 << 40;
 const WT_REFRESH: Duration = Duration::from_secs(10);
 
+/// 목록의 한 줄: 워크트리 머리줄(선택 안 됨) 또는 항목.
+pub enum Disp {
+    Header { key: usize, count: usize },
+    Item(usize),
+}
+
 /// 한 파일의 수정들을 앞뒤로 넘기며 파일 전체로 보는 화면.
 pub struct FileView {
     /// 같은 파일을 고친 수정들(항목 키, 시간순). 작업 트리 항목이 있으면 맨 끝.
@@ -214,26 +220,60 @@ impl App {
         }
     }
 
-    fn selected_entry(&self) -> Option<usize> {
-        let v = self.visible();
-        self.list.selected().and_then(|s| v.get(s)).copied()
+    /// 워크트리별로 묶은 목록. 최근에 손댄 워크트리가 아래로 간다(따라가기가 맨 아래를 고른다).
+    pub fn display(&self) -> Vec<Disp> {
+        let mut groups: Vec<(Option<PathBuf>, Vec<usize>)> = Vec::new();
+        for k in self.visible() {
+            let root = self.entry(k).root.clone();
+            match groups.iter_mut().find(|g| g.0 == root) {
+                Some(g) => g.1.push(k),
+                None => groups.push((root, vec![k])),
+            }
+        }
+        groups.sort_by_key(|g| g.1.iter().map(|&k| self.entry(k).epoch).max());
+        let mut out = Vec::new();
+        for (_, keys) in groups {
+            out.push(Disp::Header { key: keys[0], count: keys.len() });
+            out.extend(keys.into_iter().map(Disp::Item));
+        }
+        out
+    }
+
+    pub fn selected_entry(&self) -> Option<usize> {
+        match self.list.selected().and_then(|s| self.display().into_iter().nth(s)) {
+            Some(Disp::Item(k)) => Some(k),
+            _ => None,
+        }
+    }
+
+    fn last_item(d: &[Disp]) -> Option<usize> {
+        d.iter().rposition(|x| matches!(x, Disp::Item(_)))
     }
 
     fn select_last(&mut self) {
-        let n = self.visible().len();
-        self.list.select(n.checked_sub(1));
+        let d = self.display();
+        self.list.select(Self::last_item(&d));
         self.scroll = 0;
     }
 
+    /// 머리줄을 건너뛰며 delta 칸 움직인다.
     fn move_by(&mut self, delta: isize) {
-        let n = self.visible().len();
-        if n == 0 {
-            return;
+        let d = self.display();
+        let Some(last) = Self::last_item(&d) else { return };
+        let mut cur = self.list.selected().filter(|&s| s < d.len()).unwrap_or(last) as isize;
+        let step = delta.signum();
+        for _ in 0..delta.unsigned_abs().min(d.len()) {
+            let mut j = cur + step;
+            while j >= 0 && (j as usize) < d.len() && matches!(d[j as usize], Disp::Header { .. }) {
+                j += step;
+            }
+            if j < 0 || j as usize >= d.len() {
+                break;
+            }
+            cur = j;
         }
-        let cur = self.list.selected().unwrap_or(n - 1) as isize;
-        let next = (cur + delta).clamp(0, n as isize - 1) as usize;
-        self.list.select(Some(next));
-        self.follow = next == n - 1;
+        self.list.select(Some(cur as usize));
+        self.follow = cur as usize == last;
         self.scroll = 0;
     }
 
@@ -330,10 +370,10 @@ impl App {
             MouseEventKind::ScrollUp if self.diff_area.contains(pos) => self.scroll = self.scroll.saturating_sub(3),
             MouseEventKind::Down(_) if in_list && m.row > self.list_area.y => {
                 let idx = self.list.offset() + (m.row - self.list_area.y - 1) as usize;
-                let n = self.visible().len();
-                if idx < n {
+                let d = self.display();
+                if matches!(d.get(idx), Some(Disp::Item(_))) {
                     self.list.select(Some(idx));
-                    self.follow = idx == n - 1;
+                    self.follow = Some(idx) == Self::last_item(&d);
                     self.scroll = 0;
                 }
             }
