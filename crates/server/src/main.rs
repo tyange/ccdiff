@@ -16,7 +16,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::{header, HeaderValue},
+    http::{header, HeaderValue, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
     routing::get,
@@ -30,8 +30,13 @@ use guard::{Guard, WS_PROTOCOL};
 use registry::Registry;
 use tmux::Tmux;
 
-const INDEX: &str = include_str!("placeholder/index.html");
-const APP_JS: &str = include_str!("placeholder/app.js");
+// web/dist 를 넣은 목록(build.rs 가 만든다). 비어 있으면 임시 페이지를 준다.
+include!(concat!(env!("OUT_DIR"), "/assets.rs"));
+
+const PLACEHOLDER: &[(&str, &[u8])] = &[
+    ("/index.html", include_bytes!("placeholder/index.html")),
+    ("/app.js", include_bytes!("placeholder/app.js")),
+];
 
 fn usage() -> &'static str {
     "사용: worktable [--port N] [--open] | worktable doctor\n\
@@ -40,18 +45,38 @@ fn usage() -> &'static str {
      doctor 는 tmux pane 과 Claude 세션 기록을 어떻게 짝지었는지 출력한다(읽기만 한다)."
 }
 
-/// 화면 파일. 스크립트는 같은 출처에서만 읽고, 다른 사이트가 이 화면을 틀에 넣지 못하게 한다.
-async fn index() -> Response {
-    let mut resp = ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX).into_response();
-    resp.headers_mut().insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"),
-    );
-    resp
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
 }
 
-async fn app_js() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], APP_JS).into_response()
+/// 화면 파일. 스크립트는 같은 출처에서만 읽고, 다른 사이트가 이 화면을 틀에 넣지 못하게 한다.
+async fn static_file(uri: Uri) -> Response {
+    let path = match uri.path() {
+        "/" => "/index.html",
+        p => p,
+    };
+    let files = if ASSETS.is_empty() { PLACEHOLDER } else { ASSETS };
+    let Some((_, body)) = files.iter().find(|(p, _)| *p == path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut resp = ([(header::CONTENT_TYPE, content_type(path))], *body).into_response();
+    if path.ends_with(".html") {
+        resp.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"),
+        );
+    }
+    resp
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -196,11 +221,10 @@ async fn main() -> Result<()> {
     let guard = Guard::new(port, token.clone());
 
     let app = Router::new()
-        .route("/", get(index))
-        .route("/app.js", get(app_js))
         .route("/api/health", get(health))
         .route("/api/sessions", get(sessions))
         .route("/ws/events", get(events))
+        .fallback(static_file)
         .with_state(AppState { sessions: spawn_refresh(Tmux::from_env()) })
         .layer(middleware::from_fn_with_state(guard, guard::layer));
 

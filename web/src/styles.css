@@ -1,0 +1,123 @@
+:root {
+  --bg: #ffffff;
+  --panel: #f6f7f9;
+  --fg: #1f2328;
+  --muted: #656d76;
+  --line: #d0d7de;
+  --accent: #0969da;
+  --warn: #9a6700;
+  --busy: #1a7f37;
+  --sel: #ddf4ff;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --fg: #e6edf3;
+    --muted: #8d96a0;
+    --line: #30363d;
+    --accent: #4493f8;
+    --warn: #d29922;
+    --busy: #3fb950;
+    --sel: #1f2d3d;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --fg: #e6edf3;
+  --muted: #8d96a0;
+  --line: #30363d;
+  --accent: #4493f8;
+  --warn: #d29922;
+  --busy: #3fb950;
+  --sel: #1f2d3d;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+}
+
+.app {
+  height: 100%;
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1.4fr) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) 180px;
+  grid-template-areas:
+    "top top top"
+    "sessions terminal changes"
+    "sessions servers servers";
+  gap: 6px;
+  padding: 6px;
+}
+
+.topbar {
+  grid-area: top;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  color: var(--muted);
+  padding: 0 4px;
+}
+.topbar .crumbs { color: var(--fg); }
+.topbar .hint { margin-left: auto; }
+.conn.open { color: var(--busy); }
+.conn.closed, .conn.no-token { color: var(--warn); }
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  /* 지금 키 입력이 가는 칸은 테두리 색으로 보인다 */
+  border: 2px solid var(--line);
+  border-radius: 6px;
+  outline: none;
+}
+.panel.focused { border-color: var(--accent); }
+.panel.sessions { grid-area: sessions; }
+.panel.terminal { grid-area: terminal; }
+.panel.changes { grid-area: changes; }
+.panel.servers { grid-area: servers; }
+.panel-head {
+  padding: 4px 8px;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.panel-body { flex: 1; min-height: 0; overflow: auto; }
+.empty { color: var(--muted); padding: 8px; margin: 0; }
+
+.sessions { list-style: none; margin: 0; padding: 0; }
+.session {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.session.selected { background: var(--sel); box-shadow: inset 3px 0 var(--accent); }
+.session .row1 { display: flex; gap: 6px; align-items: center; }
+.session .title { font-weight: 600; }
+.session .when { margin-left: auto; color: var(--muted); font-size: 12px; }
+.session .row2 { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session .row3 { display: flex; gap: 8px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+.session .dirty { color: var(--warn); }
+.session .note { font-size: 12px; color: var(--muted); }
+.session .note.warn { color: var(--warn); }
+kbd {
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.busy { background: var(--busy); }
+.dot.idle { background: var(--accent); }
+.dot.shell { background: var(--warn); }
