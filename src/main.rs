@@ -82,8 +82,27 @@ pub struct App {
     /// 세션 첫 기록 시각. 그 전부터 있던 작업 트리 변경은 기본으로 숨긴다.
     session_start: i64,
     pub show_old_wt: bool,
-    /// 접힌 워크트리 그룹.
-    collapsed: HashSet<Option<PathBuf>>,
+    /// 펼친 워크트리 그룹. 기본은 접힘이고, 펼친 것만 실행 사이에 기억한다.
+    expanded: HashSet<Option<PathBuf>>,
+}
+
+/// 펼친 그룹 목록 파일. 한 줄에 워크트리 경로 하나, git 밖은 `-`.
+fn state_file() -> Option<PathBuf> {
+    let base = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("ccdiff/expanded"))
+}
+
+fn load_expanded() -> HashSet<Option<PathBuf>> {
+    let Some(f) = state_file() else { return HashSet::new() };
+    fs::read_to_string(f)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| if l == "-" { None } else { Some(PathBuf::from(l)) })
+        .collect()
 }
 
 impl App {
@@ -235,7 +254,7 @@ impl App {
         groups.sort_by_key(|g| g.1.iter().map(|&k| self.entry(k).epoch).max());
         let mut out = Vec::new();
         for (root, keys) in groups {
-            let collapsed = self.collapsed.contains(&root);
+            let collapsed = !self.expanded.contains(&root);
             out.push(Disp::Header { key: keys[0], count: keys.len(), collapsed });
             if !collapsed {
                 out.extend(keys.into_iter().map(Disp::Item));
@@ -253,9 +272,10 @@ impl App {
             return;
         };
         let root = self.entry(key).root.clone();
-        if !self.collapsed.remove(&root) {
-            self.collapsed.insert(root.clone());
+        if !self.expanded.remove(&root) {
+            self.expanded.insert(root.clone());
         }
+        self.save_expanded();
         let d = self.display();
         let at = d.iter().position(|x| matches!(x, Disp::Header { key, .. } if self.entry(*key).root == root));
         // 목록 길이가 바뀌므로 스크롤 위치를 처음부터 다시 잡게 한다(선택 줄은 그리기 때 보이게 맞춰진다).
@@ -267,14 +287,30 @@ impl App {
 
     fn toggle_all_groups(&mut self) {
         let roots: HashSet<Option<PathBuf>> = self.visible().into_iter().map(|k| self.entry(k).root.clone()).collect();
-        if roots.iter().any(|r| !self.collapsed.contains(r)) {
-            self.collapsed = roots;
+        if roots.iter().any(|r| self.expanded.contains(r)) {
+            self.expanded.retain(|r| !roots.contains(r));
         } else {
-            self.collapsed.clear();
+            self.expanded.extend(roots);
         }
+        self.save_expanded();
         *self.list.offset_mut() = 0;
         self.follow = true;
         self.select_last();
+    }
+
+    /// 저장 실패는 무시한다 — 기억 못 하는 것뿐 화면 동작에는 지장이 없다.
+    fn save_expanded(&self) {
+        let Some(f) = state_file() else { return };
+        let mut lines: Vec<String> = self
+            .expanded
+            .iter()
+            .map(|r| r.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()))
+            .collect();
+        lines.sort();
+        if let Some(dir) = f.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(f, lines.join("\n") + "\n");
     }
 
     pub fn on_header(&self) -> bool {
@@ -640,7 +676,7 @@ fn main() -> Result<()> {
         wt_at: None,
         session_start: 0,
         show_old_wt: false,
-        collapsed: HashSet::new(),
+        expanded: load_expanded(),
     };
     app.ingest()?;
     app.refresh_commits();

@@ -164,9 +164,20 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
                     let e = app.entry(*key);
                     let path = e.root.as_ref().map(|r| r.display().to_string()).unwrap_or_else(|| "(git 밖)".into());
                     let arrow = if *collapsed { "▸" } else { "▾" };
+                    let root = &e.root;
+                    let latest = visible.iter().filter(|&&k| &app.entry(k).root == root).map(|&k| app.entry(k)).max_by_key(|x| x.epoch);
+                    let when = latest
+                        .map(|x| {
+                            let day = x.time.get(0..5).unwrap_or("");
+                            let hm = x.time.get(6..11).unwrap_or("");
+                            let d = if day == today_md { "오늘" } else if day == yday_md { "어제" } else { day };
+                            format!("최근 {d} {hm} · ")
+                        })
+                        .unwrap_or_default();
                     return ListItem::new(Line::from(vec![
                         Span::styled(format!("{arrow} {} ", e.label()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                        Span::styled(format!("{count}건 · {path}"), gray()),
+                        Span::raw(format!("{count}건 · ")),
+                        Span::styled(format!("{when}{path}"), gray()),
                     ]));
                 }
             };
