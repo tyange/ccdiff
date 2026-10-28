@@ -1,6 +1,7 @@
 //! wtcode: 위에는 레포의 git 워크트리 목록(Enter·클릭으로 VS Code), 아래에는 오늘 투두 파일(todo.rs).
 //! 연 뒤에도 꺼지지 않는다 — tmux pane 에 띄워 두고 쓴다. 워크트리와 투두 파일이 바뀌면 화면이 따라 바뀐다.
 
+mod render;
 mod todo;
 
 use std::{
@@ -124,8 +125,11 @@ struct Todo {
     mtime: Option<SystemTime>,
     /// 고른 체크박스 줄(파일 줄 번호).
     sel: Option<usize>,
+    /// 화면 줄 단위 스크롤.
     scroll: usize,
     area: Rect,
+    /// 마지막으로 그린 화면 줄마다 파일 줄 번호(클릭용).
+    rows_src: Vec<Option<usize>>,
 }
 
 impl Todo {
@@ -339,12 +343,14 @@ impl App {
         let t = self.todo.area;
         if row > t.y && row < t.y + t.height.saturating_sub(1) && col >= t.x && col < t.x + t.width {
             self.focus = Focus::Todo;
-            let at = self.todo.scroll + (row - t.y - 1) as usize;
+            let r = self.todo.scroll + (row - t.y - 1) as usize;
+            let Some(Some(at)) = self.todo.rows_src.get(r).copied() else { return };
             if self.todo.lines.get(at).is_some_and(|l| todo::task(l).is_some()) {
                 self.todo.sel = Some(at);
-                // 체크박스(줄 앞 몇 칸)를 누르면 바로 체크한다.
+                // 그 항목의 첫 화면 줄에서 체크박스(줄 앞 몇 칸)를 누르면 바로 체크한다.
+                let first = r == 0 || self.todo.rows_src[r - 1] != Some(at);
                 let indent = self.todo.lines[at].len() - self.todo.lines[at].trim_start().len();
-                if (col - t.x) as usize <= indent + 7 {
+                if first && (col - t.x) as usize <= indent + 3 {
                     self.toggle_todo();
                 }
             }
@@ -390,107 +396,33 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.list);
 }
 
-/// 표(| a | b |) 줄들의 열 너비 — 한글은 두 칸으로 센다.
-fn table_widths(rows: &[Vec<String>]) -> Vec<usize> {
-    let mut w = Vec::new();
-    for r in rows {
-        for (i, c) in r.iter().enumerate() {
-            let n = Line::from(c.as_str()).width();
-            if w.len() <= i {
-                w.push(n);
-            } else {
-                w[i] = w[i].max(n);
-            }
-        }
-    }
-    w
-}
-
-fn cells(line: &str) -> Vec<String> {
-    line.trim().trim_matches('|').split('|').map(|c| c.trim().to_string()).collect()
-}
-
-fn is_table_sep(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with('|') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
-}
-
 fn draw_todo(f: &mut Frame, app: &mut App, area: Rect) {
     let t = &mut app.todo;
     let focused = app.focus == Focus::Todo;
-    // 표 블록마다 열 너비를 맞춘다.
-    let mut widths: Vec<Option<Vec<usize>>> = vec![None; t.lines.len()];
-    let mut i = 0;
-    while i < t.lines.len() {
-        if t.lines[i].trim_start().starts_with('|') {
-            let start = i;
-            while i < t.lines.len() && t.lines[i].trim_start().starts_with('|') {
-                i += 1;
-            }
-            let rows: Vec<Vec<String>> = (start..i).filter(|&j| !is_table_sep(&t.lines[j])).map(|j| cells(&t.lines[j])).collect();
-            let w = table_widths(&rows);
-            for slot in widths.iter_mut().take(i).skip(start) {
-                *slot = Some(w.clone());
-            }
-        } else {
-            i += 1;
+    let mut rows = render::render(&t.lines, area.width.saturating_sub(2) as usize);
+    if focused {
+        for r in rows.iter_mut().filter(|r| r.src.is_some() && r.src == t.sel) {
+            r.line = std::mem::take(&mut r.line).style(Style::default().add_modifier(Modifier::REVERSED));
         }
     }
-    let gray = Style::default().fg(Color::DarkGray);
-    let rendered: Vec<Line> = t
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(n, l)| {
-            let sel = focused && t.sel == Some(n);
-            let base = if sel { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
-            if let Some(h) = l.strip_prefix("## ") {
-                return Line::from(Span::styled(h.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-            }
-            if let Some(h) = l.strip_prefix("# ") {
-                return Line::from(Span::styled(h.to_string(), Style::default().add_modifier(Modifier::BOLD)));
-            }
-            if let Some(done) = todo::task(l) {
-                let indent = l.len() - l.trim_start().len();
-                let text = l.trim_start()[5..].trim_start().to_string();
-                let (mark, st) = if done { ("✓", gray.add_modifier(Modifier::CROSSED_OUT)) } else { ("☐", Style::default()) };
-                return Line::from(vec![
-                    Span::raw(" ".repeat(indent)),
-                    Span::styled(format!("{mark} "), if done { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Yellow) }),
-                    Span::styled(text, st),
-                ])
-                .style(base);
-            }
-            if let Some(w) = &widths[n] {
-                if is_table_sep(l) {
-                    return Line::from(Span::styled(w.iter().map(|x| "─".repeat(*x)).collect::<Vec<_>>().join("─┼─"), gray));
-                }
-                let cs = cells(l);
-                let mut spans = Vec::new();
-                for (i, c) in cs.iter().enumerate() {
-                    if i > 0 {
-                        spans.push(Span::styled(" │ ", gray));
-                    }
-                    let pad = w.get(i).copied().unwrap_or(0).saturating_sub(Line::from(c.as_str()).width());
-                    spans.push(Span::raw(format!("{c}{}", " ".repeat(pad))));
-                }
-                return Line::from(spans);
-            }
-            Line::from(l.as_str())
-        })
-        .collect();
-    // 고른 줄이 보이게 스크롤한다.
+    // 고른 항목의 화면 줄이 모두 보이게 스크롤한다.
     let h = area.height.saturating_sub(2) as usize;
-    if let Some(s) = t.sel {
-        if s < t.scroll {
-            t.scroll = s;
-        } else if h > 0 && s >= t.scroll + h {
-            t.scroll = s + 1 - h;
+    let span = t.sel.map(|s| {
+        let first = rows.iter().position(|r| r.src == Some(s)).unwrap_or(0);
+        let last = rows.iter().rposition(|r| r.src == Some(s)).unwrap_or(first);
+        (first, last)
+    });
+    if let Some((first, last)) = span {
+        if first < t.scroll {
+            t.scroll = first;
+        } else if h > 0 && last >= t.scroll + h {
+            t.scroll = (last + 1).saturating_sub(h).min(first);
         }
     }
-    t.scroll = t.scroll.min(rendered.len().saturating_sub(h));
+    t.scroll = t.scroll.min(rows.len().saturating_sub(h));
+    t.rows_src = rows.iter().map(|r| r.src).collect();
     let title = format!(" 투두 · {} ", t.path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default());
-    let p = Paragraph::new(rendered)
+    let p = Paragraph::new(rows.into_iter().map(|r| r.line).collect::<Vec<_>>())
         .block(Block::default().borders(Borders::ALL).border_style(border(focused)).title(title))
         .scroll((t.scroll as u16, 0));
     t.area = area;
@@ -579,7 +511,15 @@ fn main() -> Result<()> {
         items: Vec::new(),
         list: ListState::default(),
         list_area: Rect::default(),
-        todo: Todo { path: todo_path, lines: Vec::new(), mtime: None, sel: None, scroll: 0, area: Rect::default() },
+        todo: Todo {
+            path: todo_path,
+            lines: Vec::new(),
+            mtime: None,
+            sel: None,
+            scroll: 0,
+            area: Rect::default(),
+            rows_src: Vec::new(),
+        },
         focus: Focus::Worktrees,
         mode: Mode::Normal,
         notice: None,
@@ -610,13 +550,5 @@ mod tests {
         assert_eq!(issue_number("myrepo-gh123", "feature/x"), Some(123));
         assert_eq!(issue_number("myrepo", "feat/GH-45-login"), Some(45));
         assert_eq!(issue_number("myrepo", "develop"), None);
-    }
-
-    #[test]
-    fn table_helpers() {
-        assert!(is_table_sep("|---|:--:|"));
-        assert!(!is_table_sep("| GH-1 | 리뷰 |"));
-        assert_eq!(cells("| GH-1 | 리뷰 중 | 머지 |"), vec!["GH-1", "리뷰 중", "머지"]);
-        assert_eq!(table_widths(&[vec!["a".into(), "리뷰".into()]]), vec![1, 4]);
     }
 }
