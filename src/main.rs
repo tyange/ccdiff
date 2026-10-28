@@ -48,6 +48,23 @@ impl EditEntry {
             None => self.path.display().to_string(),
         }
     }
+
+    /// 목록용 짧은 워크트리 이름: `abc-web-apps-gh2171` → `gh2171`, 메인 레포는 `main`.
+    fn label(&self) -> String {
+        let Some(root) = &self.root else { return "-".into() };
+        let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match name.rfind("-gh") {
+            Some(i) => name[i + 1..].to_string(),
+            None if name.chars().any(|c| c == '-') && name.rsplit('-').next().is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) => {
+                name.rsplit('-').next().unwrap_or_default().to_string()
+            }
+            None => "main".into(),
+        }
+    }
+
+    fn file_name(&self) -> String {
+        self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
 }
 
 /// 세션 JSONL 을 이어 읽는다. 쓰는 중인 마지막 줄은 다음 읽기까지 남겨 둔다.
@@ -186,6 +203,7 @@ struct App {
     list: ListState,
     follow: bool,
     scroll: u16,
+    hscroll: u16,
     hide_outside: bool,
 }
 
@@ -267,10 +285,7 @@ fn truncate_left(s: &str, width: usize) -> String {
 }
 
 fn diff_lines(e: &EditEntry) -> Vec<Line<'static>> {
-    let mut out = vec![Line::from(Span::styled(
-        e.path.display().to_string(),
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    let mut out = Vec::new();
     if e.user_modified {
         out.push(Line::from(Span::styled(
             "사용자가 승인 전에 손으로 고친 수정",
@@ -315,20 +330,27 @@ fn diff_lines(e: &EditEntry) -> Vec<Line<'static>> {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
-    let [left, right] = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).areas(main);
+    // 좁은 pane(tmux 반쪽 등)에서는 목록을 위, diff 를 아래로 쌓는다.
+    let [left, right] = if main.width < 140 {
+        Layout::vertical([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(main)
+    } else {
+        Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).areas(main)
+    };
 
     let visible = app.visible();
-    let path_width = (left.width as usize).saturating_sub(34);
+    let name_width = (left.width as usize).saturating_sub(36);
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&i| {
             let e = &app.entries[i];
+            let hm = e.time.get(6..11).unwrap_or(&e.time);
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", e.time), Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{:<9}", e.kind)),
+                Span::styled(format!("{hm} "), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{:<7}", e.kind)),
                 Span::styled(format!("+{:<4}", e.added), Style::default().fg(Color::Green)),
                 Span::styled(format!("-{:<4} ", e.removed), Style::default().fg(Color::Red)),
-                Span::raw(truncate_left(&e.short_path(), path_width)),
+                Span::styled(format!("{:<8} ", e.label()), Style::default().fg(Color::Yellow)),
+                Span::raw(truncate_left(&e.file_name(), name_width)),
             ]))
         })
         .collect();
@@ -341,21 +363,32 @@ fn draw(f: &mut Frame, app: &mut App) {
         .highlight_style(Style::default().bg(Color::Rgb(40, 50, 70)).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(list, left, &mut app.list);
 
-    let body = app
-        .list
-        .selected()
-        .and_then(|s| visible.get(s))
-        .map(|&i| diff_lines(&app.entries[i]))
+    let selected = app.list.selected().and_then(|s| visible.get(s)).map(|&i| &app.entries[i]);
+    let title_width = (right.width as usize).saturating_sub(4);
+    let title = match selected {
+        Some(e) => {
+            let head = format!(" {} · {} · ", e.time, e.label());
+            let rel = match &e.root {
+                Some(r) => e.path.strip_prefix(r).unwrap_or(&e.path).display().to_string(),
+                None => e.path.display().to_string(),
+            };
+            let room = title_width.saturating_sub(head.chars().count() + 1);
+            format!("{head}{} ", truncate_left(&rel, room))
+        }
+        None => format!(" {} ", app.session),
+    };
+    let body = selected
+        .map(diff_lines)
         .unwrap_or_else(|| vec![Line::from("아직 수정이 없다")]);
     let diff = Paragraph::new(body)
-        .block(Block::default().borders(Borders::ALL).title(format!(" {} ", app.session)))
-        .scroll((app.scroll, 0));
+        .block(Block::default().borders(Borders::ALL).title(truncate_left(&title, title_width)))
+        .scroll((app.scroll, app.hscroll));
     f.render_widget(diff, right);
 
     let follow = if app.follow { "따라가기 켜짐" } else { "따라가기 꺼짐" };
     f.render_widget(
         Paragraph::new(format!(
-            " {follow} │ j/k 이동 · J/K·PgUp/PgDn 스크롤 · g/G 처음/끝 · f 따라가기 · w 워크트리 · h git 밖 표시 · q 종료"
+            " {follow} │ j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · h git 밖 · q 종료"
         ))
         .style(Style::default().fg(Color::DarkGray)),
         status,
@@ -382,6 +415,8 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     KeyCode::Char('K') => app.scroll = app.scroll.saturating_sub(1),
                     KeyCode::PageDown => app.scroll = app.scroll.saturating_add(20),
                     KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(20),
+                    KeyCode::Right => app.hscroll = app.hscroll.saturating_add(8),
+                    KeyCode::Left => app.hscroll = app.hscroll.saturating_sub(8),
                     KeyCode::Char('g') | KeyCode::Home => {
                         app.follow = false;
                         app.move_by(isize::MIN / 2);
@@ -471,6 +506,7 @@ fn main() -> Result<()> {
         list: ListState::default(),
         follow: true,
         scroll: 0,
+        hscroll: 0,
         hide_outside: true,
     };
     app.ingest()?;
