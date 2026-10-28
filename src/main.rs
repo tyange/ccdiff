@@ -82,6 +82,8 @@ pub struct App {
     /// 읽은 줄의 uuid — 이어진 세션은 앞 세션 줄을 옮겨 담아 시작하므로 겹치는 줄을 거른다.
     seen: HashSet<String>,
     found_at: Option<Instant>,
+    /// 상태줄에 잠깐 띄우는 알림.
+    pub notice: Option<(String, Instant)>,
     roots: HashMap<PathBuf, Option<PathBuf>>,
     pub entries: Vec<EditEntry>,
     repo_order: Vec<Option<PathBuf>>,
@@ -646,6 +648,60 @@ impl App {
     }
 
     /// 드래그로 줄을 고른다. 손을 떼면 Claude 에 보낸다.
+    /// 열 줄: 고른 줄이 있으면 그 첫 줄, 없으면 화면에 보이는 첫 변경 줄(없으면 맨 위 줄).
+    fn target_line(&self) -> Option<(usize, usize)> {
+        if let Some(s) = &self.sel {
+            let rows = self.rows.get(&s.key)?;
+            let (a, b) = s.range();
+            let no = rows.get(a..=b.min(rows.len().saturating_sub(1)))?.iter().find_map(|r| r.new_no.or(r.old_no))?;
+            return Some((s.key, no));
+        }
+        let shown: Vec<(usize, usize)> = self.diff_rows.iter().flatten().copied().collect();
+        let &(key, _) = shown.first()?;
+        let rows = self.rows.get(&key)?;
+        let pick = shown.iter().find(|&&(_, j)| rows[j].is_change() && rows[j].new_no.is_some()).or_else(|| shown.iter().find(|&&(_, j)| rows[j].new_no.is_some()));
+        let no = pick.and_then(|&(_, j)| rows[j].new_no).unwrap_or(1);
+        Some((key, no))
+    }
+
+    /// 실제 IDE 로 그 줄을 연다. CCDIFF_EDITOR 로 바꿀 수 있다: {root} {file} {line} 이 채워진다.
+    fn open_in_editor(&mut self) {
+        let Some((key, line)) = self.target_line() else {
+            self.notice = Some(("열 파일이 없다 — 항목을 고른 뒤 e".into(), Instant::now()));
+            return;
+        };
+        let e = self.entry(key);
+        if !e.path.exists() {
+            self.notice = Some((format!("파일이 지금은 없다: {}", e.short_path()), Instant::now()));
+            return;
+        }
+        let root = e.root.clone().or_else(|| e.path.parent().map(PathBuf::from)).unwrap_or_default();
+        // 워크트리 폴더를 같이 넘겨, 그 워크트리 창에서 열리게 한다.
+        let tpl = env::var("CCDIFF_EDITOR").unwrap_or_else(|_| "code {root} -g {file}:{line}".into());
+        let fill = |t: &str| {
+            t.replace("{root}", &root.to_string_lossy())
+                .replace("{file}", &e.path.to_string_lossy())
+                .replace("{line}", &line.to_string())
+        };
+        let mut parts = tpl.split_whitespace().map(fill);
+        let Some(cmd) = parts.next() else { return };
+        let spawned = std::process::Command::new(&cmd)
+            .args(parts)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let msg = match spawned {
+            // 기다리지 않으면 좀비로 남는다 — 따로 거둔다.
+            Ok(mut child) => {
+                std::thread::spawn(move || child.wait());
+                format!("{cmd} 로 열었다: {}:{line}", e.short_path())
+            }
+            Err(err) => format!("{cmd} 실행 실패: {err} (CCDIFF_EDITOR 로 바꿀 수 있다)"),
+        };
+        self.notice = Some((msg, Instant::now()));
+    }
+
     /// 화면 맨 위 줄부터 고른다(첫 변경 줄이 보이면 그 줄).
     fn start_key_selection(&mut self) {
         let shown: Vec<(usize, usize)> = self.diff_rows.iter().flatten().copied().collect();
@@ -794,6 +850,10 @@ impl App {
             KeyCode::Char('b') => {
                 self.hl.light = !self.hl.light;
                 self.reset_highlight();
+                return false;
+            }
+            KeyCode::Char('e') => {
+                self.open_in_editor();
                 return false;
             }
             KeyCode::Right => {
@@ -1007,6 +1067,7 @@ fn main() -> Result<()> {
         known: HashSet::from([path]),
         seen: HashSet::new(),
         found_at: None,
+        notice: None,
         roots: HashMap::new(),
         entries: Vec::new(),
         repo_order: Vec::new(),

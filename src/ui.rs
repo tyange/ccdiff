@@ -156,14 +156,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             None => "파일 보기",
         };
         format!(
-            "{ide} {state} · {theme} │ v 줄 고르기(j/k 늘이기·드래그) · n/p 다음·이전 수정 · r 처음부터 재생 · space 일시정지 · j/k·PgUp/PgDn 스크롤 · g/G 처음/끝 · Esc 목록 · t 테마 · b 밝기"
+            "{ide} {state} · {theme} │ v 줄 고르기(j/k 늘이기·드래그) · e IDE 로 열기 · n/p 다음·이전 수정 · r 처음부터 재생 · space 일시정지 · j/k·PgUp/PgDn 스크롤 · g/G 처음/끝 · Esc 목록 · t 테마 · b 밝기"
         )
     } else {
         draw_list(f, app, main);
         let follow = if app.follow { "따라가기 켜짐" } else { "따라가기 꺼짐" };
         format!(
-            "{ide} {follow} · {theme} │ 드래그 줄 고르기 → Claude · Enter 파일 보기·그룹 접기 · z/Z 그룹 접기/전부 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · c 커밋 필터 · a 세션 전 변경 · h git 밖 · t 테마 · b 밝기 · q 종료"
+            "{ide} {follow} · {theme} │ 드래그 줄 고르기 → Claude · e IDE 로 열기 · Enter 파일 보기·그룹 접기 · z/Z 그룹 접기/전부 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · c 커밋 필터 · a 세션 전 변경 · h git 밖 · t 테마 · b 밝기 · q 종료"
         )
+    };
+    let text = match &app.notice {
+        Some((m, at)) if at.elapsed().as_secs() < 4 => format!(" {m}"),
+        _ => text,
     };
     f.render_widget(Paragraph::new(text).style(gray()), status);
 }
