@@ -153,29 +153,100 @@ fn table(lines: &[String], start: usize, end: usize, width: usize, out: &mut Vec
         }
         return;
     }
-    // 카드: 첫 행은 머리(열 이름)로 쓴다.
+    // 카드: 첫 행은 머리(열 이름)로 쓴다. 카드 사이는 한 줄 띄운다.
     let Some(((_, head), body)) = rows.split_first() else { return };
-    for (i, r) in body {
+    let label_w = head.iter().skip(1).map(|h| w(h)).max().unwrap_or(0);
+    for (n, (i, r)) in body.iter().enumerate() {
+        if n > 0 {
+            out.push(Row { line: Line::default(), src: None });
+        }
         let title = r.first().cloned().unwrap_or_default();
-        for l in wrap(Vec::new(), inline(&title, Style::default().add_modifier(Modifier::BOLD)), 2, width) {
+        let prefix = vec![Span::styled("▌ ", Style::default().fg(Color::Cyan))];
+        for l in wrap(prefix, inline(&title, Style::default().add_modifier(Modifier::BOLD)), 2, width) {
             out.push(Row { line: l, src: Some(*i) });
         }
         for (k, c) in r.iter().enumerate().skip(1) {
             let name = head.get(k).cloned().unwrap_or_default();
-            let prefix = vec![Span::raw("  "), Span::styled(format!("{name} · "), gray)];
-            let indent = 2 + w(&name) + 3;
-            for l in wrap(prefix, inline(c, Style::default()), indent, width) {
-                out.push(Row { line: l, src: Some(*i) });
+            // "다음" 은 색을 달리해 상태와 가른다.
+            let label_st = if name.contains("다음") { Style::default().fg(Color::Green) } else { gray };
+            let pad = " ".repeat(label_w.saturating_sub(w(&name)));
+            let base = 2 + label_w + 2;
+            let parts = split_top(c);
+            for (m, part) in parts.iter().enumerate() {
+                let lead = if m == 0 {
+                    vec![Span::raw("  "), Span::styled(format!("{name}{pad}  "), label_st)]
+                } else {
+                    vec![Span::raw(" ".repeat(base))]
+                };
+                // 여러 갈래면 갈래마다 · 를 붙여 줄바꿈과 구분한다.
+                let (prefix, indent) = if parts.len() > 1 {
+                    let mut p = lead;
+                    p.push(Span::styled("· ", gray));
+                    (p, base + 2)
+                } else {
+                    (lead, base)
+                };
+                for l in wrap(prefix, inline(part, Style::default()), indent, width) {
+                    out.push(Row { line: l, src: Some(*i) });
+                }
             }
         }
     }
 }
 
+/// 괄호 바깥의 ` · ` 에서 나눈다 — `PR ② 완료(tsc·eslint 0 · 회귀 24 passed)` 의 괄호 안은 그대로 둔다.
+fn split_top(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut cur = String::new();
+    let mut rest = s;
+    while let Some(ch) = rest.chars().next() {
+        if depth == 0 && rest.starts_with(" · ") {
+            out.push(std::mem::take(&mut cur));
+            rest = &rest[" · ".len()..];
+            continue;
+        }
+        match ch {
+            '(' | '[' | '{' | '「' | '（' => depth += 1,
+            ')' | ']' | '}' | '」' | '）' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        cur.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out.push(cur);
+    out.retain(|p| !p.trim().is_empty());
+    out
+}
+
+/// 섹션(`## 이름`) 안 항목 수. 투두는 남은 것, 표는 데이터 행, 나머지는 불릿.
+fn section_count(lines: &[String], at: usize) -> Option<String> {
+    let body: Vec<&String> = lines[at + 1..].iter().take_while(|l| !l.starts_with("## ") && !l.starts_with("# ")).collect();
+    let tasks: Vec<bool> = body.iter().filter_map(|l| todo::task(l)).collect();
+    if !tasks.is_empty() {
+        let open = tasks.iter().filter(|d| !**d).count();
+        return Some(format!("남은 {open} / {}", tasks.len()));
+    }
+    let rows = body.iter().filter(|l| is_table(l) && !is_table_sep(l)).count();
+    if rows > 1 {
+        return Some((rows - 1).to_string());
+    }
+    let bullets = body.iter().filter(|l| l.trim_start().starts_with("- ") || l.trim_start().starts_with("* ")).count();
+    (bullets > 0).then(|| bullets.to_string())
+}
+
 pub fn render(lines: &[String], width: usize) -> Vec<Row> {
     let mut out = Vec::new();
     let mut i = 0;
+    // 목록 항목(투두·불릿)이 이어지면 사이에 한 줄 띄운다.
+    let mut prev_item = false;
     while i < lines.len() {
         let l = &lines[i];
+        let item = todo::task(l).is_some() || l.trim_start().starts_with("- ") || l.trim_start().starts_with("* ");
+        if item && prev_item {
+            out.push(Row { line: Line::default(), src: None });
+        }
+        prev_item = item;
         if is_table(l) {
             let start = i;
             while i < lines.len() && is_table(&lines[i]) {
@@ -186,7 +257,12 @@ pub fn render(lines: &[String], width: usize) -> Vec<Row> {
         }
         let src = Some(i);
         if let Some(h) = l.strip_prefix("## ") {
-            out.push(Row { line: Line::from(Span::styled(h.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))), src });
+            let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let mut spans = vec![Span::styled("▍", head), Span::styled(h.to_string(), head)];
+            if let Some(n) = section_count(lines, i) {
+                spans.push(Span::styled(format!(" · {n}"), Style::default().fg(Color::DarkGray)));
+            }
+            out.push(Row { line: Line::from(spans), src });
         } else if let Some(h) = l.strip_prefix("# ") {
             out.push(Row { line: Line::from(Span::styled(h.to_string(), Style::default().add_modifier(Modifier::BOLD))), src });
         } else if let Some(done) = todo::task(l) {
@@ -223,6 +299,22 @@ pub fn render(lines: &[String], width: usize) -> Vec<Row> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn splits_outside_parens() {
+        assert_eq!(split_top("a · b(c · d) · e"), vec!["a", "b(c · d)", "e"]);
+        assert_eq!(split_top("하나"), vec!["하나"]);
+    }
+
+    #[test]
+    fn spaces_list_items_and_counts_sections() {
+        let lines: Vec<String> = ["## 투두", "", "- [ ] 하나", "- [x] 둘"].iter().map(|s| s.to_string()).collect();
+        let rows = render(&lines, 40);
+        assert_eq!(text(&rows[0]), "▍투두 · 남은 1 / 2");
+        // 제목, 빈 줄, 하나, 띄운 줄, 둘
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[3].src, None);
+    }
+
     fn text(r: &Row) -> String {
         r.line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
@@ -247,8 +339,8 @@ mod tests {
     fn wide_table_becomes_cards() {
         let lines: Vec<String> = ["| 이슈 | 상태 | 다음 |", "|---|---|---|", "| GH-1 | 아주 긴 상태 설명이 여기에 들어간다 | 머지 |"].iter().map(|s| s.to_string()).collect();
         let narrow = render(&lines, 24);
-        assert_eq!(text(&narrow[0]), "GH-1");
-        assert!(narrow.iter().any(|r| text(r).contains("상태 · ")));
+        assert_eq!(text(&narrow[0]), "▌ GH-1");
+        assert!(narrow.iter().any(|r| text(r).starts_with("  상태  ")));
         assert!(narrow.iter().all(|r| r.src == Some(2)));
         let wide = render(&lines, 200);
         assert_eq!(wide.len(), 3);

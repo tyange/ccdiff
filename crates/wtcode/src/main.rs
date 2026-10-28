@@ -133,6 +133,8 @@ struct Todo {
     area: Rect,
     /// 마지막으로 그린 화면 줄마다 파일 줄 번호(클릭용).
     rows_src: Vec<Option<usize>>,
+    /// 다음 그리기에서 고른 항목이 보이게 스크롤할지 — 키로 고를 때만. 휠로 굴린 위치는 그대로 둔다.
+    follow: bool,
 }
 
 impl Todo {
@@ -162,7 +164,24 @@ impl Todo {
             return;
         }
         let cur = self.sel.and_then(|s| tasks.iter().position(|&i| i == s)).unwrap_or(0) as isize;
+        // 첫 투두에서 더 위로 가면 맨 위(끝난 것·진행 중)를 보인다 — 투두가 아닌 곳은 고를 수 없어서.
+        if d < 0 && cur == 0 {
+            self.scroll = 0;
+            self.follow = false;
+            return;
+        }
         self.sel = Some(tasks[(cur + d).clamp(0, tasks.len() as isize - 1) as usize]);
+        self.follow = true;
+    }
+
+    /// 보이는 범위만 굴린다(선택은 그대로). 끝은 그릴 때 맞춘다.
+    fn scroll_by(&mut self, d: isize) {
+        self.scroll = (self.scroll as isize + d).max(0) as usize;
+        self.follow = false;
+    }
+
+    fn page(&self) -> isize {
+        self.area.height.saturating_sub(3).max(1) as isize
     }
 }
 
@@ -339,6 +358,10 @@ impl App {
                 }
                 KeyCode::Char('j') | KeyCode::Down => self.todo.move_by(1),
                 KeyCode::Char('k') | KeyCode::Up => self.todo.move_by(-1),
+                KeyCode::PageDown => self.todo.scroll_by(self.todo.page()),
+                KeyCode::PageUp => self.todo.scroll_by(-self.todo.page()),
+                KeyCode::Char('g') | KeyCode::Home => self.todo.scroll_by(isize::MIN / 2),
+                KeyCode::Char('G') | KeyCode::End => self.todo.scroll_by(isize::MAX / 2),
                 KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('x') => self.toggle_todo(),
                 KeyCode::Char('d') => {
                     if let Some(at) = self.todo.sel {
@@ -493,13 +516,14 @@ fn draw_todo(f: &mut Frame, app: &mut App, area: Rect) {
         let last = rows.iter().rposition(|r| r.src == Some(s)).unwrap_or(first);
         (first, last)
     });
-    if let Some((first, last)) = span {
+    if let Some((first, last)) = span.filter(|_| t.follow) {
         if first < t.scroll {
             t.scroll = first;
         } else if h > 0 && last >= t.scroll + h {
             t.scroll = (last + 1).saturating_sub(h).min(first);
         }
     }
+    t.follow = false;
     t.scroll = t.scroll.min(rows.len().saturating_sub(h));
     t.rows_src = rows.iter().map(|r| r.src).collect();
     let to = app.target.as_ref().map(|p| format!(" → {}", p.label)).unwrap_or_default();
@@ -563,10 +587,16 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 }
             }
             Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollDown if app.focus == Focus::Todo => app.todo.move_by(1),
-                MouseEventKind::ScrollUp if app.focus == Focus::Todo => app.todo.move_by(-1),
-                MouseEventKind::ScrollDown => app.move_by(1),
-                MouseEventKind::ScrollUp => app.move_by(-1),
+                // 휠은 마우스가 올라간 칸을 굴린다. 투두 칸은 선택을 옮기지 않고 보이는 범위만.
+                MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                    let d = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
+                    let t = app.todo.area;
+                    if m.row >= t.y && m.row < t.y + t.height {
+                        app.todo.scroll_by(3 * d);
+                    } else {
+                        app.move_by(d);
+                    }
+                }
                 MouseEventKind::Down(MouseButton::Left) => app.on_click(m.column, m.row),
                 _ => {}
             },
@@ -616,6 +646,8 @@ fn main() -> Result<()> {
             scroll: 0,
             area: Rect::default(),
             rows_src: Vec::new(),
+            // 처음에는 맨 위(끝난 것·진행 중)부터 보인다.
+            follow: false,
         },
         focus: Focus::Worktrees,
         mode: Mode::Normal,
