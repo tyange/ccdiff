@@ -4,6 +4,7 @@ mod replay;
 mod rows;
 mod session;
 mod ui;
+mod worktree;
 
 use std::{
     collections::HashMap,
@@ -30,11 +31,15 @@ use git::{CommitState, GitIndex};
 use highlight::Highlighter;
 use replay::{Replay, Step};
 use rows::{build_rows, Row, RowKind};
-use session::{parse_entry, EditEntry, Tail};
+use session::{bash_roots, parse_entry, EditEntry, Tail};
+
+/// 작업 트리 항목의 키 시작값. 세션 수정은 0부터, 작업 트리 항목은 WT 부터 센다.
+pub const WT: usize = 1 << 40;
+const WT_REFRESH: Duration = Duration::from_secs(10);
 
 /// 한 파일의 수정들을 앞뒤로 넘기며 파일 전체로 보는 화면.
 pub struct FileView {
-    /// 같은 파일을 고친 수정들(entries 인덱스, 시간순).
+    /// 같은 파일을 고친 수정들(항목 키, 시간순). 작업 트리 항목이 있으면 맨 끝.
     pub seq: Vec<usize>,
     pub pos: usize,
     pub scroll: u16,
@@ -64,19 +69,44 @@ pub struct App {
     pub commits: HashMap<usize, CommitState>,
     /// 0 전체 · 1 미커밋만 · 2 커밋만
     commit_filter: u8,
+    /// git diff 를 볼 워크트리(세션이 고쳤거나 Bash 로 다룬 곳).
+    wt_roots: Vec<PathBuf>,
+    pub wt: Vec<EditEntry>,
+    wt_at: Option<Instant>,
+    /// 세션 첫 기록 시각. 그 전부터 있던 작업 트리 변경은 기본으로 숨긴다.
+    session_start: i64,
+    pub show_old_wt: bool,
 }
 
 impl App {
     fn ingest(&mut self) -> Result<bool> {
         let mut changed = false;
         for line in self.tail.read_lines()? {
+            if self.session_start == 0 {
+                self.session_start = session::line_epoch(&line);
+            }
+            for r in bash_roots(&line, &mut self.roots) {
+                if !self.wt_roots.contains(&r) {
+                    self.wt_roots.push(r);
+                    self.wt_at = None;
+                }
+            }
             if let Some(e) = parse_entry(&line, &mut self.roots) {
+                if let Some(r) = &e.root {
+                    if !self.wt_roots.contains(r) {
+                        self.wt_roots.push(r.clone());
+                        self.wt_at = None;
+                    }
+                }
                 if !self.repo_order.contains(&e.root) {
                     self.repo_order.push(e.root.clone());
                 }
-                if let Some(fv) = &mut self.file {
-                    if self.entries[fv.seq[0]].path == e.path {
-                        fv.seq.push(self.entries.len());
+                if let Some(fv) = &self.file {
+                    if self.entry(fv.seq[0]).path == e.path {
+                        let key = self.entries.len();
+                        let fv = self.file.as_mut().expect("file view");
+                        let at = if fv.seq.last().is_some_and(|&k| k >= WT) { fv.seq.len() - 1 } else { fv.seq.len() };
+                        fv.seq.insert(at, key);
                     }
                 }
                 self.entries.push(e);
@@ -89,18 +119,57 @@ impl App {
         Ok(changed)
     }
 
-    pub fn ensure_rows(&mut self, i: usize) {
-        if !self.rows.contains_key(&i) {
-            let rows = build_rows(&self.entries[i], &self.hl);
-            self.rows.insert(i, rows);
+    pub fn entry(&self, key: usize) -> &EditEntry {
+        if key >= WT { &self.wt[key - WT] } else { &self.entries[key] }
+    }
+
+    pub fn ensure_rows(&mut self, key: usize) {
+        if !self.rows.contains_key(&key) {
+            let rows = build_rows(self.entry(key), &self.hl);
+            self.rows.insert(key, rows);
+        }
+    }
+
+    /// 작업 트리 항목을 다시 읽는다. 열려 있는 파일 보기의 작업 트리 키도 새 번호로 맞춘다.
+    fn refresh_worktrees(&mut self) {
+        if self.wt_at.is_some_and(|t| t.elapsed() < WT_REFRESH) {
+            return;
+        }
+        self.wt_at = Some(Instant::now());
+        self.wt = self.wt_roots.iter().flat_map(|r| worktree::entries(r)).collect();
+        self.rows.retain(|&k, _| k < WT);
+        for e in &self.wt {
+            if !self.repo_order.contains(&e.root) {
+                self.repo_order.push(e.root.clone());
+            }
+        }
+        if let Some(fv) = &self.file {
+            let path = self.entry(fv.seq[0]).path.clone();
+            let wt_key = self.wt.iter().position(|e| e.path == path).map(|j| WT + j);
+            let fv = self.file.as_mut().expect("file view");
+            fv.seq.retain(|&k| k < WT);
+            fv.seq.extend(wt_key);
+            if fv.seq.is_empty() {
+                self.file = None;
+            } else if fv.pos >= fv.seq.len() {
+                fv.pos = fv.seq.len() - 1;
+            }
+        }
+        if self.follow {
+            self.select_last();
         }
     }
 
     pub fn visible(&self) -> Vec<usize> {
         let want = self.filter.map(|i| &self.repo_order[i]);
-        (0..self.entries.len())
-            .filter(|&i| want.is_none_or(|r| &self.entries[i].root == r))
-            .filter(|&i| !self.hide_outside || self.entries[i].root.is_some())
+        let since = if self.show_old_wt { i64::MIN } else { self.session_start - 60 };
+        // 지워진 파일은 mtime 이 없어 0 이다 — 시각으로 거르지 않는다.
+        let wt = (0..self.wt.len()).filter(|&j| self.wt[j].epoch == 0 || self.wt[j].epoch >= since).map(|j| WT + j);
+        let mut keys: Vec<usize> = (0..self.entries.len()).chain(wt).collect();
+        keys.sort_by_key(|&k| self.entry(k).epoch);
+        keys.into_iter()
+            .filter(|&i| want.is_none_or(|r| &self.entry(i).root == r))
+            .filter(|&i| !self.hide_outside || self.entry(i).root.is_some())
             .filter(|&i| match self.commit_filter {
                 1 => !self.is_committed(i),
                 2 => self.is_committed(i),
@@ -193,8 +262,11 @@ impl App {
 
     fn open_file(&mut self) {
         let Some(idx) = self.selected_entry() else { return };
-        let path = &self.entries[idx].path;
-        let seq: Vec<usize> = (0..self.entries.len()).filter(|&i| &self.entries[i].path == path).collect();
+        let path = &self.entry(idx).path;
+        let seq: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| &self.entries[i].path == path)
+            .chain(self.wt.iter().position(|e| &e.path == path).map(|j| WT + j))
+            .collect();
         let pos = seq.iter().position(|&i| i == idx).unwrap_or(0);
         self.hscroll = 0;
         self.file = Some(FileView { seq, pos, scroll: 0, jump: true, replay: None });
@@ -324,6 +396,11 @@ impl App {
                 }
             }
             KeyCode::Char('w') => self.cycle_filter(),
+            KeyCode::Char('a') => {
+                self.show_old_wt = !self.show_old_wt;
+                self.follow = true;
+                self.select_last();
+            }
             KeyCode::Char('c') => {
                 self.commit_filter = (self.commit_filter + 1) % 3;
                 self.follow = true;
@@ -389,6 +466,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         // git 호출이 화면을 잠깐 멈추게 하므로 재생 중에는 미룬다.
         if !app.replaying() {
             app.refresh_commits();
+            app.refresh_worktrees();
         }
         terminal.draw(|f| ui::draw(f, app))?;
         let wait = if app.replaying() { 30 } else { 300 };
@@ -481,9 +559,15 @@ fn main() -> Result<()> {
         git: GitIndex::default(),
         commits: HashMap::new(),
         commit_filter: 0,
+        wt_roots: Vec::new(),
+        wt: Vec::new(),
+        wt_at: None,
+        session_start: 0,
+        show_old_wt: false,
     };
     app.ingest()?;
     app.refresh_commits();
+    app.refresh_worktrees();
     app.select_last();
 
     // 되살린 "수정 후 파일" 이 같은 파일의 다음 수정의 "수정 전 파일" 과 같은지 본다.
@@ -507,13 +591,32 @@ fn main() -> Result<()> {
                 println!("불일치: {} {} (줄 {:?}, {}줄 vs {}줄)", app.entries[i].time, app.entries[i].short_path(), at.map(|x| x + 1), after.len(), expect.len());
             }
         }
+        // 작업 트리 항목: HEAD 에 git diff 를 적용한 결과가 디스크의 지금 파일과 같아야 한다.
+        app.refresh_worktrees();
+        for j in 0..app.wt.len() {
+            let key = WT + j;
+            let Ok(disk) = fs::read_to_string(&app.wt[j].path) else { continue };
+            app.ensure_rows(key);
+            let after: Vec<String> = app.rows[&key]
+                .iter()
+                .filter(|r| r.kind != RowKind::Del)
+                .map(|r| r.spans.iter().map(|(_, t)| t.as_str()).collect())
+                .collect();
+            if after == disk.lines().collect::<Vec<_>>() {
+                ok += 1;
+            } else {
+                bad += 1;
+                println!("불일치(작업 트리): {}", app.wt[j].short_path());
+            }
+        }
         println!("검증: 일치 {ok} · 불일치 {bad}");
         return Ok(());
     }
 
     if list_only {
-        for (i, e) in app.visible().into_iter().map(|i| (i, &app.entries[i])) {
+        for (i, e) in app.visible().into_iter().map(|i| (i, app.entry(i))) {
             let c = match app.commits.get(&i) {
+                _ if i >= WT => "◆ 작업트리".into(),
                 Some(CommitState::Yes { hash, .. }) => format!("✓ {hash}"),
                 Some(CommitState::No) => "● 미커밋".into(),
                 Some(CommitState::Changed { hash, .. }) => format!("◐ {hash}"),

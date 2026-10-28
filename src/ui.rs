@@ -10,7 +10,7 @@ use crate::{
     git::CommitState,
     replay::Phase,
     rows::{compact, Row, RowKind},
-    App,
+    App, WT,
 };
 
 /// 바뀐 줄 배경을 줄 끝까지 칠하려고 붙이는 공백 수.
@@ -67,8 +67,14 @@ fn row_line(r: &Row, bgs: (Color, Color), reveal: Option<usize>, cursor: bool) -
 }
 
 /// 목록 줄 앞 표시와 제목 꼬리.
-fn commit_mark(st: Option<&CommitState>) -> (Span<'static>, String) {
-    match st {
+fn commit_mark(app: &App, key: usize) -> (Span<'static>, String) {
+    if key >= WT {
+        return (
+            Span::styled("◆ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            " · ◆ 작업 트리(HEAD 대비, Bash 수정 포함)".to_string(),
+        );
+    }
+    match app.commits.get(&key) {
         Some(CommitState::Yes { hash, subject }) => (
             Span::styled("✓ ", Style::default().fg(Color::Green)),
             format!(" · ✓ {hash} {subject}"),
@@ -112,7 +118,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_list(f, app, main);
         let follow = if app.follow { "따라가기 켜짐" } else { "따라가기 꺼짐" };
         format!(
-            " {follow} · {theme} │ Enter 파일 보기 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · c 커밋 필터 · h git 밖 · t 테마 · b 밝기 · q 종료"
+            " {follow} · {theme} │ Enter 파일 보기 · j/k 이동 · J/K·PgUp/PgDn 스크롤 · ←/→ 가로 · g/G 처음/끝 · f 따라가기 · w 워크트리 · c 커밋 필터 · a 세션 전 변경 · h git 밖 · t 테마 · b 밝기 · q 종료"
         )
     };
     f.render_widget(Paragraph::new(text).style(gray()), status);
@@ -134,7 +140,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&i| {
-            let e = &app.entries[i];
+            let e = app.entry(i);
             let hm = e.time.get(6..11).unwrap_or(&e.time);
             let day = e.time.get(0..5).unwrap_or("");
             // 한글 두 글자는 4칸이라 공백 하나를 더해 `10-27`(5칸)과 폭을 맞춘다.
@@ -145,7 +151,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
             } else {
                 (day.to_string(), gray())
             };
-            let (mark, _) = commit_mark(app.commits.get(&i));
+            let (mark, _) = commit_mark(app, i);
             // 커밋된 수정은 흐리게 — 아직 리뷰할 게 남은 미커밋 쪽으로 눈이 가게 한다.
             let dim = if app.is_committed(i) { gray() } else { Style::default() };
             ListItem::new(Line::from(vec![
@@ -177,7 +183,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
     let (title, body) = match sel {
         Some(i) => {
             app.ensure_rows(i);
-            let e = &app.entries[i];
+            let e = app.entry(i);
             let rows = &app.rows[&i];
             let bgs = app.hl.diff_bgs();
             let mut body = Vec::new();
@@ -194,7 +200,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
             if body.is_empty() {
                 body.push(Line::from("(diff 없음)"));
             }
-            let (_, tail) = commit_mark(app.commits.get(&i));
+            let (_, tail) = commit_mark(app, i);
             let head = format!(" {} · {} · ", e.time, e.label());
             let room = title_width.saturating_sub(head.chars().count() + tail.chars().count() + 1);
             (format!("{head}{}{tail} ", truncate_left(&e.rel_path(), room)), body)
@@ -279,9 +285,9 @@ fn draw_file(f: &mut Frame, app: &mut App, area: Rect) {
     fv.scroll = fv.scroll.min(max_scroll);
     let (scroll, pos, n) = (fv.scroll, fv.pos, fv.seq.len());
 
-    let e = &app.entries[idx];
+    let e = app.entry(idx);
     let title_width = (area.width as usize).saturating_sub(4);
-    let (_, tail) = commit_mark(app.commits.get(&idx));
+    let (_, tail) = commit_mark(app, idx);
     let head = format!(" 수정 {}/{} · {} · {} · ", pos + 1, n, e.time, e.label());
     let room = title_width.saturating_sub(head.chars().count() + tail.chars().count() + 1);
     let title = format!("{head}{}{tail} ", truncate_left(&e.rel_path(), room));

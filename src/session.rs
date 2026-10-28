@@ -107,7 +107,7 @@ impl Tail {
     }
 }
 
-fn git_root(dir: &Path) -> Option<PathBuf> {
+pub fn git_root(dir: &Path) -> Option<PathBuf> {
     let mut cur = Some(dir);
     while let Some(d) = cur {
         if d.join(".git").exists() {
@@ -120,6 +120,61 @@ fn git_root(dir: &Path) -> Option<PathBuf> {
 
 fn epoch(ts: Option<&str>) -> i64 {
     ts.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|d| d.timestamp()).unwrap_or(0)
+}
+
+/// 기록 한 줄의 timestamp(유닉스 초). 없으면 0.
+pub fn line_epoch(line: &str) -> i64 {
+    let key = "\"timestamp\":\"";
+    let Some(i) = line.find(key) else { return 0 };
+    let rest = &line[i + key.len()..];
+    let ts = rest.split('"').next();
+    epoch(ts)
+}
+
+pub fn fmt_epoch(epoch: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch, 0)
+        .filter(|_| epoch > 0)
+        .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "--".into())
+}
+
+/// Bash 명령에 나온 절대경로들의 git 루트. Bash 로만 고친 워크트리를 찾는 데 쓴다.
+pub fn bash_roots(line: &str, roots: &mut HashMap<PathBuf, Option<PathBuf>>) -> Vec<PathBuf> {
+    if !line.contains("\"name\":\"Bash\"") {
+        return Vec::new();
+    }
+    let Ok(v) = serde_json::from_str::<Value>(line) else { return Vec::new() };
+    let Some(content) = v.pointer("/message/content").and_then(Value::as_array) else { return Vec::new() };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = Vec::new();
+    for c in content {
+        if c.get("name").and_then(Value::as_str) != Some("Bash") {
+            continue;
+        }
+        let Some(cmd) = c.pointer("/input/command").and_then(Value::as_str) else { continue };
+        for tok in cmd.split(|ch: char| ch.is_whitespace() || ";|&()<>\"'=`$".contains(ch)) {
+            let tok = match tok.strip_prefix("~/") {
+                Some(rest) => format!("{home}/{rest}"),
+                None if tok.starts_with('/') => tok.to_string(),
+                None => continue,
+            };
+            let mut dir = PathBuf::from(tok);
+            while !dir.is_dir() {
+                if !dir.pop() {
+                    break;
+                }
+            }
+            if dir.as_os_str().is_empty() || dir == Path::new("/") {
+                continue;
+            }
+            if let Some(root) = roots.entry(dir.clone()).or_insert_with(|| git_root(&dir)).clone() {
+                if !out.contains(&root) {
+                    out.push(root);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn local_time(ts: Option<&str>) -> String {
