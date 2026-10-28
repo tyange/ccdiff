@@ -9,8 +9,11 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout},
+    crossterm::{
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
+        execute,
+    },
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -205,6 +208,8 @@ struct App {
     scroll: u16,
     hscroll: u16,
     hide_outside: bool,
+    list_area: Rect,
+    diff_area: Rect,
 }
 
 impl App {
@@ -249,6 +254,27 @@ impl App {
         self.list.select(Some(next));
         self.follow = next == n - 1;
         self.scroll = 0;
+    }
+
+    fn on_mouse(&mut self, m: &MouseEvent) {
+        let pos = Position::new(m.column, m.row);
+        let in_list = self.list_area.contains(pos);
+        match m.kind {
+            MouseEventKind::ScrollDown if in_list => self.move_by(1),
+            MouseEventKind::ScrollUp if in_list => self.move_by(-1),
+            MouseEventKind::ScrollDown if self.diff_area.contains(pos) => self.scroll = self.scroll.saturating_add(3),
+            MouseEventKind::ScrollUp if self.diff_area.contains(pos) => self.scroll = self.scroll.saturating_sub(3),
+            MouseEventKind::Down(_) if in_list && m.row > self.list_area.y => {
+                let idx = self.list.offset() + (m.row - self.list_area.y - 1) as usize;
+                let n = self.visible().len();
+                if idx < n {
+                    self.list.select(Some(idx));
+                    self.follow = idx == n - 1;
+                    self.scroll = 0;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn cycle_filter(&mut self) {
@@ -360,8 +386,11 @@ fn draw(f: &mut Frame, app: &mut App) {
             visible.len(),
             app.filter_label()
         )))
-        .highlight_style(Style::default().bg(Color::Rgb(40, 50, 70)).add_modifier(Modifier::BOLD));
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+        .highlight_symbol("▶ ");
     f.render_stateful_widget(list, left, &mut app.list);
+    app.list_area = left;
+    app.diff_area = right;
 
     let selected = app.list.selected().and_then(|s| visible.get(s)).map(|&i| &app.entries[i]);
     let title_width = (right.width as usize).saturating_sub(4);
@@ -399,7 +428,11 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| draw(f, app))?;
         if event::poll(Duration::from_millis(300))? {
-            if let Event::Key(k) = event::read()? {
+            let ev = event::read()?;
+            if let Event::Mouse(m) = &ev {
+                app.on_mouse(m);
+            }
+            if let Event::Key(k) = ev {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -508,6 +541,8 @@ fn main() -> Result<()> {
         scroll: 0,
         hscroll: 0,
         hide_outside: true,
+        list_area: Rect::default(),
+        diff_area: Rect::default(),
     };
     app.ingest()?;
     app.select_last();
@@ -520,7 +555,9 @@ fn main() -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableMouseCapture)?;
     let result = run(&mut terminal, &mut app);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
