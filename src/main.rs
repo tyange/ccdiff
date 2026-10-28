@@ -20,6 +20,12 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use serde_json::Value;
+use syntect::{
+    easy::HighlightLines,
+    highlighting::Theme,
+    parsing::{SyntaxReference, SyntaxSet},
+};
+use two_face::theme::EmbeddedThemeName;
 
 const MAX_CREATE_LINES: usize = 3000;
 
@@ -210,6 +216,8 @@ struct App {
     hide_outside: bool,
     list_area: Rect,
     diff_area: Rect,
+    hl: Highlighter,
+    rendered: HashMap<usize, Vec<Line<'static>>>,
 }
 
 impl App {
@@ -310,7 +318,26 @@ fn truncate_left(s: &str, width: usize) -> String {
     format!("…{tail}")
 }
 
-fn diff_lines(e: &EditEntry) -> Vec<Line<'static>> {
+struct Highlighter {
+    syntaxes: SyntaxSet,
+    theme: Theme,
+}
+
+impl Highlighter {
+    fn new() -> Self {
+        let theme = two_face::theme::extra().get(EmbeddedThemeName::OneHalfDark).clone();
+        Self { syntaxes: two_face::syntax::extra_newlines(), theme }
+    }
+
+    fn syntax_for(&self, path: &Path) -> &SyntaxReference {
+        path.extension()
+            .and_then(|x| x.to_str())
+            .and_then(|x| self.syntaxes.find_syntax_by_extension(x))
+            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text())
+    }
+}
+
+fn diff_lines(e: &EditEntry, hl: &Highlighter) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     if e.user_modified {
         out.push(Line::from(Span::styled(
@@ -322,7 +349,11 @@ fn diff_lines(e: &EditEntry) -> Vec<Line<'static>> {
         out.push(Line::from("(diff 없음)"));
     }
     let gutter = Style::default().fg(Color::DarkGray);
+    let add_bg = Color::Rgb(22, 52, 34);
+    let del_bg = Color::Rgb(66, 28, 30);
+    // hunk 는 파일 조각이라 문법 상태가 조각 사이에서 끊긴다 — 조각마다 새로 시작한다.
     for h in &e.hunks {
+        let mut hi = HighlightLines::new(hl.syntax_for(&e.path), &hl.theme);
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
             format!("@@ -{} +{} @@", h.old_start, h.new_start),
@@ -330,25 +361,44 @@ fn diff_lines(e: &EditEntry) -> Vec<Line<'static>> {
         )));
         let (mut old, mut new) = (h.old_start, h.new_start);
         for l in &h.lines {
-            let (o, n, style) = match l.chars().next() {
-                Some('+') => {
+            let mut chars = l.chars();
+            let mark = chars.next().unwrap_or(' ');
+            let code = chars.as_str();
+            let (o, n, bg, mark_fg) = match mark {
+                '+' => {
                     new += 1;
-                    (String::new(), (new - 1).to_string(), Style::default().fg(Color::Green))
+                    (String::new(), (new - 1).to_string(), Some(add_bg), Color::Green)
                 }
-                Some('-') => {
+                '-' => {
                     old += 1;
-                    ((old - 1).to_string(), String::new(), Style::default().fg(Color::Red))
+                    ((old - 1).to_string(), String::new(), Some(del_bg), Color::Red)
                 }
                 _ => {
                     old += 1;
                     new += 1;
-                    ((old - 1).to_string(), (new - 1).to_string(), Style::default())
+                    ((old - 1).to_string(), (new - 1).to_string(), None, Color::DarkGray)
                 }
             };
-            out.push(Line::from(vec![
-                Span::styled(format!("{o:>5} {n:>5} │ "), gutter),
-                Span::styled(l.clone(), style),
-            ]));
+            let with_bg = |st: Style| match bg {
+                Some(c) => st.bg(c),
+                None => st,
+            };
+            let mut spans = vec![
+                Span::styled(format!("{o:>5} {n:>5} "), gutter),
+                Span::styled(format!("{mark} "), with_bg(Style::default().fg(mark_fg))),
+            ];
+            let line = format!("{code}\n");
+            match hi.highlight_line(&line, &hl.syntaxes) {
+                Ok(parts) => spans.extend(parts.into_iter().map(|(st, text)| {
+                    let c = st.foreground;
+                    Span::styled(
+                        text.trim_end_matches('\n').to_string(),
+                        with_bg(Style::default().fg(Color::Rgb(c.r, c.g, c.b))),
+                    )
+                })),
+                Err(_) => spans.push(Span::styled(code.to_string(), with_bg(Style::default()))),
+            }
+            out.push(Line::from(spans));
         }
     }
     out
@@ -392,7 +442,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.list_area = left;
     app.diff_area = right;
 
-    let selected = app.list.selected().and_then(|s| visible.get(s)).map(|&i| &app.entries[i]);
+    let sel_idx = app.list.selected().and_then(|s| visible.get(s)).copied();
+    if let Some(i) = sel_idx {
+        if !app.rendered.contains_key(&i) {
+            let lines = diff_lines(&app.entries[i], &app.hl);
+            app.rendered.insert(i, lines);
+        }
+    }
+    let selected = sel_idx.map(|i| &app.entries[i]);
     let title_width = (right.width as usize).saturating_sub(4);
     let title = match selected {
         Some(e) => {
@@ -406,8 +463,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         }
         None => format!(" {} ", app.session),
     };
-    let body = selected
-        .map(diff_lines)
+    let body = sel_idx
+        .and_then(|i| app.rendered.get(&i).cloned())
         .unwrap_or_else(|| vec![Line::from("아직 수정이 없다")]);
     let diff = Paragraph::new(body)
         .block(Block::default().borders(Borders::ALL).title(truncate_left(&title, title_width)))
@@ -543,6 +600,8 @@ fn main() -> Result<()> {
         hide_outside: true,
         list_area: Rect::default(),
         diff_area: Rect::default(),
+        hl: Highlighter::new(),
+        rendered: HashMap::new(),
     };
     app.ingest()?;
     app.select_last();
