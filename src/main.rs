@@ -499,14 +499,27 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
 
     let visible = app.visible();
-    let name_width = (left.width as usize).saturating_sub(36);
+    let today = chrono::Local::now().date_naive();
+    let md = |d: chrono::NaiveDate| d.format("%m-%d").to_string();
+    let (today_md, yday_md) = (md(today), today.pred_opt().map(md).unwrap_or_default());
+    let name_width = (left.width as usize).saturating_sub(42);
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&i| {
             let e = &app.entries[i];
             let hm = e.time.get(6..11).unwrap_or(&e.time);
+            let day = e.time.get(0..5).unwrap_or("");
+            // 한글 두 글자는 4칸이라 공백 하나를 더해 `10-27`(5칸)과 폭을 맞춘다.
+            let (day_label, day_style) = if day == today_md {
+                ("오늘 ".to_string(), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+            } else if day == yday_md {
+                ("어제 ".to_string(), Style::default().fg(Color::Magenta))
+            } else {
+                (day.to_string(), Style::default().fg(Color::DarkGray))
+            };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{hm} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{day_label} "), day_style),
+                Span::raw(format!("{hm} ")),
                 Span::raw(format!("{:<7}", e.kind)),
                 Span::styled(format!("+{:<4}", e.added), Style::default().fg(Color::Green)),
                 Span::styled(format!("-{:<4} ", e.removed), Style::default().fg(Color::Red)),
