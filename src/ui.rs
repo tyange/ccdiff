@@ -92,6 +92,19 @@ fn commit_mark(app: &App, key: usize) -> (Span<'static>, String) {
     }
 }
 
+/// 목록에 이름이 겹치는 파일이 있으면 상위 폴더까지 붙인다(`ko/lang.json`).
+fn display_name(e: &crate::session::EditEntry, count: &std::collections::HashMap<String, usize>) -> String {
+    let name = e.file_name();
+    if count.get(&name).copied().unwrap_or(0) < 2 {
+        return name;
+    }
+    let parent = e.path.parent().and_then(|p| p.file_name()).map(|p| p.to_string_lossy().into_owned());
+    match parent {
+        Some(p) => format!("{p}/{name}"),
+        None => name,
+    }
+}
+
 fn truncate_left(s: &str, width: usize) -> String {
     let n = s.chars().count();
     if n <= width || width < 2 {
@@ -137,6 +150,10 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
     let md = |d: chrono::NaiveDate| d.format("%m-%d").to_string();
     let (today_md, yday_md) = (md(today), today.pred_opt().map(md).unwrap_or_default());
     let name_width = (left.width as usize).saturating_sub(44);
+    let mut name_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for &i in &visible {
+        *name_count.entry(app.entry(i).file_name()).or_default() += 1;
+    }
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&i| {
@@ -162,7 +179,7 @@ fn draw_list(f: &mut Frame, app: &mut App, main: Rect) {
                 Span::styled(format!("+{:<4}", e.added), Style::default().fg(Color::Green)),
                 Span::styled(format!("-{:<4} ", e.removed), Style::default().fg(Color::Red)),
                 Span::styled(format!("{:<8} ", e.label()), Style::default().fg(Color::Yellow)),
-                Span::styled(truncate_left(&e.file_name(), name_width), dim),
+                Span::styled(truncate_left(&display_name(e, &name_count), name_width), dim),
             ]))
         })
         .collect();
