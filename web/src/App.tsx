@@ -6,6 +6,7 @@ import { ImportDialog, NewSessionDialog } from "./Dialogs";
 import { Palette, type Command } from "./Palette";
 import { Servers } from "./Servers";
 import { SessionList } from "./SessionList";
+import { clamp, Split, useStored } from "./Split";
 import { Terminal, type TerminalHandle } from "./Terminal";
 import type { Session } from "./types";
 
@@ -37,6 +38,11 @@ export function App() {
   const [focused, setFocused] = useState<Panel | null>(null);
   const [now, setNow] = useState(() => Date.now() / 1000);
   const panels = useRef<Record<Panel, HTMLElement | null>>({ sessions: null, terminal: null, changes: null, servers: null });
+  // 칸 크기: 세션 목록 너비(px), 터미널이 가운데에서 차지하는 비율, 서버 칸 높이(px).
+  const app = useRef<HTMLDivElement>(null);
+  const [sessW, setSessW] = useStored("sessions-w", 260);
+  const [termFr, setTermFr] = useStored("terminal-fr", 0.58);
+  const [srvH, setSrvH] = useStored("servers-h", 200);
   const terminal = useRef<TerminalHandle>(null);
   const changes = useRef<ChangesHandle>(null);
   const [importing, setImporting] = useState<Session | null>(null);
@@ -169,7 +175,14 @@ export function App() {
 
   const w = current?.worktree;
   return (
-    <div className="app">
+    <div
+      className="app"
+      ref={app}
+      style={{
+        gridTemplateColumns: `${sessW}px 6px minmax(0, ${termFr}fr) 6px minmax(0, ${1 - termFr}fr)`,
+        gridTemplateRows: `auto minmax(0, 1fr) 6px ${srvH}px`,
+      }}
+    >
       <div className="topbar">
         <span className={`conn ${conn}`}>{CONN_LABEL[conn]}</span>
         {current && (
@@ -180,7 +193,6 @@ export function App() {
         )}
         {pendingPane && <span>새 세션 기다리는 중…</span>}
         <button onClick={() => setStarting(true)}>새 세션…</button>
-        <span className="hint">⌘K 명령 · ⌘1–9 세션 · ⌘J 변경 칸 · ⌘↑↓ 파일 · ⌘⇧↑↓ 수정 · ⌘E 편집기</span>
       </div>
       {panel(
         "sessions",
@@ -194,6 +206,31 @@ export function App() {
         <Changes ref={changes} session={current} focusTerminal={() => terminal.current?.focus()} />,
       )}
       {panel("servers", "서버", <Servers session={current} />)}
+      <Split
+        dir="x"
+        className="s1"
+        onDrag={(x) => setSessW(clamp(x - (app.current?.getBoundingClientRect().left ?? 0) - 6, 160, 640))}
+        onReset={() => setSessW(260)}
+      />
+      <Split
+        dir="x"
+        className="s2"
+        onDrag={(x) => {
+          const t = panels.current.terminal?.getBoundingClientRect();
+          const c = panels.current.changes?.getBoundingClientRect();
+          if (t && c) setTermFr(clamp((x - t.left) / (c.right - t.left), 0.15, 0.85));
+        }}
+        onReset={() => setTermFr(0.58)}
+      />
+      <Split
+        dir="y"
+        className="s3"
+        onDrag={(_, y) => {
+          const r = app.current?.getBoundingClientRect();
+          if (r) setSrvH(clamp(r.bottom - 6 - y, 60, r.height - 160));
+        }}
+        onReset={() => setSrvH(200)}
+      />
       {importing && (
         <ImportDialog
           session={importing}

@@ -32,7 +32,7 @@ export function SessionList(props: {
 }) {
   const { sessions, selected, onSelect, now } = props;
   if (sessions.length === 0) {
-    return <p className="empty">tmux 에서 도는 Claude 가 없다</p>;
+    return null;
   }
   return (
     <ul className="sessions" role="listbox" aria-label="세션">
@@ -64,8 +64,16 @@ export function SessionList(props: {
               <span>수정 {s.edits}</span>
               {s.worktrees.length > 1 && <span>워크트리 {s.worktrees.length}</span>}
             </div>
-            {s.parked && <div className="note">⧗ 백그라운드 작업으로 넘김 · {s.parked.status}</div>}
-            {note && <div className="note warn">⚠ {note}</div>}
+            {(s.parked || note) && (
+              <div className="note">
+                {s.parked && <span title="백그라운드 작업으로 넘긴 세션">⧗ {s.parked.status}</span>}
+                {note && (
+                  <span className="warn" title={note}>
+                    ⚠
+                  </span>
+                )}
+              </div>
+            )}
           </li>
         );
       })}

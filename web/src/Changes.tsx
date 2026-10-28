@@ -5,6 +5,7 @@ import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState }
 
 import { postJson } from "./api";
 import { monaco } from "./monaco";
+import { clamp, Split, useStored } from "./Split";
 import type { ChangeItem, DiffResult, Mark, Session } from "./types";
 
 export interface ChangesHandle {
@@ -57,6 +58,8 @@ export const Changes = forwardRef<ChangesHandle, { session: Session | null; focu
     const [sent, setSent] = useState<Sent | null>(null);
     const [notice, setNotice] = useState<string | null>(null);
     const box = useRef<HTMLDivElement>(null);
+    const root = useRef<HTMLDivElement>(null);
+    const [filesH, setFilesH] = useStored("changes-files-h", 160);
     const editor = useRef<monaco.editor.IStandaloneDiffEditor | null>(null);
     const key = session?.key ?? null;
 
@@ -262,9 +265,8 @@ export const Changes = forwardRef<ChangesHandle, { session: Session | null; focu
     let lastWt = "";
 
     return (
-      <div className="changes">
+      <div className="changes" ref={root} style={{ gridTemplateRows: `${filesH}px 6px auto minmax(0, 1fr) auto` }}>
         <div className="files">
-          {files.length === 0 && <p className="empty">{session ? "이 세션의 변경이 없다" : "세션을 고르세요"}</p>}
           {files.map((f) => {
             const last = f.items[f.items.length - 1];
             const head = f.worktree !== lastWt ? <div className="wt-head">{(lastWt = f.worktree) || "(git 밖)"}</div> : null;
@@ -294,6 +296,14 @@ export const Changes = forwardRef<ChangesHandle, { session: Session | null; focu
             );
           })}
         </div>
+        <Split
+          dir="y"
+          onDrag={(_, y) => {
+            const r = root.current?.getBoundingClientRect();
+            if (r) setFilesH(clamp(y - r.top, 40, r.height - 120));
+          }}
+          onReset={() => setFilesH(160)}
+        />
         <div className="diff-head">
           {diff ? (
             <>
@@ -312,7 +322,11 @@ export const Changes = forwardRef<ChangesHandle, { session: Session | null; focu
                   </button>
                 </span>
               )}
-              {current?.partial && <span className="muted">수정 전 파일이 기록에 없어 바뀐 부분만</span>}
+              {current?.partial && (
+                <span className="muted" title="수정 전 파일이 기록에 없어 바뀐 부분만 보인다">
+                  일부
+                </span>
+              )}
               <span className="spacer" />
               <label>
                 <input type="checkbox" checked={collapse} onChange={(e) => setCollapse(e.target.checked)} /> 접기
@@ -324,30 +338,32 @@ export const Changes = forwardRef<ChangesHandle, { session: Session | null; focu
                 VS Code ⌘E
               </button>
             </>
-          ) : (
-            <span className="muted">파일을 고르세요 · ⌘↑/⌘↓ 파일 · ⌘⇧↑/⌘⇧↓ 수정</span>
-          )}
+          ) : null}
         </div>
         <div className="diff-box">
-          {diff?.secret && <p className="empty">시크릿 파일 — 내용을 띄우지 않는다</p>}
+          {diff?.secret && (
+            <p className="empty" title="시크릿 파일은 내용을 띄우지 않는다">
+              시크릿
+            </p>
+          )}
           <div className="monaco" ref={box} style={{ visibility: current ? "visible" : "hidden" }} />
         </div>
         <div className="sel-bar">
-          {sent ? (
+          {session && (
+            <span
+              className={session.ide ? "ide on" : "ide off"}
+              title={session.ide ? "Claude 가 worktable IDE 에 붙어 있다" : "Claude 에서 /ide 로 worktable 을 고르면 줄 선택을 보낼 수 있다"}
+            >
+              IDE
+            </span>
+          )}
+          {sent && (
             <>
-              <span>⧉ {sent.lines}줄 → Claude</span>
-              {sent.claude === 0 && (
-                <span className="warn">이 세션 Claude 가 worktable IDE 에 붙지 않았다 — Claude 에서 /ide 로 worktable 을 고르세요</span>
-              )}
+              <span className={sent.claude === 0 ? "warn" : ""}>⧉ {sent.lines}줄</span>
               <button className="link" onClick={clearSelection}>
-                선택 지우기
+                지우기
               </button>
             </>
-          ) : (
-            <span className="muted">
-              수정 후 쪽에서 줄을 드래그하면 Claude 에 보낸다
-              {session && !session.ide && " · 이 세션 Claude 는 아직 worktable IDE 에 붙지 않았다(/ide)"}
-            </span>
           )}
           {notice && <span className="notice">{notice}</span>}
           {error && <span className="warn">{error}</span>}

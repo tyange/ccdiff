@@ -114,7 +114,6 @@ export function NewSessionDialog(props: {
 
   return (
     <Modal title="새 세션 시작" onClose={onClose}>
-      <p className="muted">이미 있는 워크트리에서 worktable 세션의 새 window 로 claude 를 띄운다.</p>
       {!list && !error && <p>워크트리를 읽는 중…</p>}
       {list && list.length === 0 && <p>세션들이 다룬 레포에서 워크트리를 찾지 못했다.</p>}
       {list && (

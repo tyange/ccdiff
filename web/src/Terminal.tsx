@@ -126,7 +126,7 @@ export const Terminal = forwardRef<TerminalHandle, { session: Session | null; on
       };
     }, [paneId, paneSession, retry]);
 
-    let head: React.ReactNode = "세션을 고르세요";
+    let head: React.ReactNode = null;
     if (attach.state === "connecting") head = "붙는 중…";
     if (attach.state === "closed")
       head = (
@@ -136,13 +136,13 @@ export const Terminal = forwardRef<TerminalHandle, { session: Session | null; on
       );
     if (attach.state === "attached")
       head = attach.owned ? (
-        <>worktable · 이 칸 크기를 따른다</>
+        <span title="worktable 세션 — 이 칸 크기를 따른다">worktable</span>
       ) : (
         <>
-          보기 모드 · {attach.session} 세션 · 크기는 그 세션에 붙은 터미널을 따른다
+          <span title={`${attach.session} 세션 — 크기는 그 세션에 붙은 터미널을 따른다`}>보기 모드</span>
           {session && (
             <button className="link" onClick={() => onImport(session)}>
-              worktable 로 가져오기…
+              가져오기…
             </button>
           )}
         </>

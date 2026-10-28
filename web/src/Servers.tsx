@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { getJson, postJson, wsArgs } from "./api";
 import { Modal } from "./Dialogs";
+import { clamp, Split, useStored } from "./Split";
 import type { DevServer, Session } from "./types";
 
 interface Plan {
@@ -101,6 +102,8 @@ export function Servers({ session }: { session: Session | null }) {
   const [restarting, setRestarting] = useState<DevServer | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const root = useRef<HTMLDivElement>(null);
+  const [listW, setListW] = useStored("servers-list-w", 340);
 
   useEffect(() => {
     let live = true;
@@ -129,9 +132,9 @@ export function Servers({ session }: { session: Session | null }) {
   const current = servers.find((s) => s.id === selected) ?? null;
 
   return (
-    <div className="servers">
+    <div className="servers" ref={root} style={{ gridTemplateColumns: `${listW}px 6px minmax(0, 1fr)` }}>
       <div className="srv-list">
-        {rows.length === 0 && <p className="empty">{error ?? "dev 서버를 찾지 못했다"}</p>}
+        {error && <p className="empty">{error}</p>}
         {rows.map((s) => (
           <div
             key={s.id}
@@ -152,10 +155,20 @@ export function Servers({ session }: { session: Session | null }) {
                 </a>
               ))}
             </span>
-            <span className="srv-owner">{s.kind === "detached" ? `pane 밖 · ${s.owner ?? "띄운 쪽 모름"}` : s.running ? "" : "멈춤"}</span>
+            <span className="srv-owner" title={s.kind === "detached" ? "pane 밖에서 띄운 서버 — 로그 없음, 재시작 안 함" : undefined}>
+              {s.kind === "detached" ? (s.owner ?? "") : s.running ? "" : "멈춤"}
+            </span>
           </div>
         ))}
       </div>
+      <Split
+        dir="x"
+        onDrag={(x) => {
+          const r = root.current?.getBoundingClientRect();
+          if (r) setListW(clamp(x - r.left, 160, r.width - 160));
+        }}
+        onReset={() => setListW(340)}
+      />
       <div className="srv-detail">
         {current ? (
           <>
@@ -169,17 +182,9 @@ export function Servers({ session }: { session: Session | null }) {
                 </button>
               )}
             </div>
-            {current.kind === "pane" ? (
-              <Log pane={current.id} />
-            ) : (
-              <p className="empty">
-                pane 밖에서 띄운 서버다(띄운 쪽: {current.owner ?? "모름"}). 출력이 버려져 로그가 없고, 남의 것이라 여기서 재시작하지 않는다.
-              </p>
-            )}
+            {current.kind === "pane" && <Log pane={current.id} />}
           </>
-        ) : (
-          <p className="empty">서버를 고르면 로그가 보인다 · 로그의 키·토큰처럼 보이는 값은 가린다</p>
-        )}
+        ) : null}
         {notice && <div className="notice">{notice}</div>}
       </div>
       {restarting && (

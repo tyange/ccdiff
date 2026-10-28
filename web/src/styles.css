@@ -45,18 +45,27 @@ body {
   font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
 }
 
+/* 열·행 크기는 App 이 끌어서 바꾼 값으로 style 에 넣는다. 경계선(6px)이 칸 사이 간격을 겸한다. */
 .app {
   height: 100%;
   display: grid;
-  grid-template-columns: 260px minmax(0, 1.4fr) minmax(0, 1fr);
-  grid-template-rows: auto minmax(0, 1fr) 180px;
   grid-template-areas:
-    "top top top"
-    "sessions terminal changes"
-    "sessions servers servers";
-  gap: 6px;
+    "top top top top top"
+    "sessions s1 terminal s2 changes"
+    "sessions s1 s3 s3 s3"
+    "sessions s1 servers servers servers";
   padding: 6px;
 }
+.topbar { margin-bottom: 6px; }
+.split { touch-action: none; }
+.split.x { cursor: col-resize; }
+.split.y { cursor: row-resize; }
+.split:hover, body.dragging-x .split.x, body.dragging-y .split.y { background: var(--line); border-radius: 3px; }
+.split.s1 { grid-area: s1; }
+.split.s2 { grid-area: s2; }
+.split.s3 { grid-area: s3; }
+body.dragging-x, body.dragging-x * { cursor: col-resize !important; user-select: none !important; }
+body.dragging-y, body.dragging-y * { cursor: row-resize !important; user-select: none !important; }
 
 .topbar {
   grid-area: top;
@@ -67,7 +76,6 @@ body {
   padding: 0 4px;
 }
 .topbar .crumbs { color: var(--fg); }
-.topbar .hint { margin-left: auto; }
 .conn.open { color: var(--busy); }
 .conn.closed, .conn.no-token { color: var(--warn); }
 
@@ -176,8 +184,8 @@ button.link { border: none; background: none; color: var(--accent); padding: 0 4
 }
 
 .p-changes .panel-body { overflow: hidden; }
-.changes { display: grid; grid-template-rows: minmax(60px, 32%) auto minmax(0, 1fr) auto; flex: 1; min-height: 0; }
-.changes .files { overflow: auto; border-bottom: 1px solid var(--line); font-size: 12px; }
+.changes { display: grid; flex: 1; min-height: 0; }
+.changes .files { overflow: auto; font-size: 12px; }
 .changes .wt-head { padding: 3px 8px; color: var(--muted); font-weight: 600; background: var(--bg); position: sticky; top: 0; }
 .changes .file { display: flex; gap: 6px; padding: 1px 8px; cursor: pointer; white-space: nowrap; }
 .changes .file.selected { background: var(--sel); box-shadow: inset 3px 0 var(--accent); }
@@ -203,8 +211,8 @@ button.link { border: none; background: none; color: var(--accent); padding: 0 4
 .changes .notice { color: var(--accent); }
 
 .p-servers .panel-body { overflow: hidden; }
-.servers { display: grid; grid-template-columns: minmax(260px, 40%) minmax(0, 1fr); flex: 1; min-height: 0; }
-.srv-list { overflow: auto; border-right: 1px solid var(--line); font-size: 12px; }
+.servers { display: grid; flex: 1; min-height: 0; }
+.srv-list { overflow: auto; font-size: 12px; }
 .srv { display: flex; gap: 8px; align-items: center; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
 .srv.selected { background: var(--sel); box-shadow: inset 3px 0 var(--accent); }
 .srv.mine .srv-wt { color: var(--accent); font-weight: 600; }
@@ -229,3 +237,7 @@ button.link { border: none; background: none; color: var(--accent); padding: 0 4
 .palette li.active { background: var(--sel); }
 .palette li kbd { margin-left: auto; }
 .palette li .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ide { font-size: 11px; padding: 0 4px; border-radius: 3px; border: 1px solid var(--line); }
+.ide.on { color: var(--busy); border-color: var(--busy); }
+.ide.off { color: var(--muted); text-decoration: line-through; }
+.session .note { display: flex; gap: 6px; }
