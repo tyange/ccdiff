@@ -1048,7 +1048,7 @@ fn main() -> Result<()> {
 
     // 화면을 띄울 때만 연다 — --list·--verify 가 잠금 파일을 남기지 않게.
     if env::var_os("CCDIFF_NO_IDE").is_none() {
-        app.ide = Ide::start(app.t.cwd.iter().chain(&app.t.wt_roots).cloned().collect());
+        app.ide = Ide::start("ccdiff", app.t.cwd.iter().chain(&app.t.wt_roots).cloned().collect());
     }
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableMouseCapture)?;

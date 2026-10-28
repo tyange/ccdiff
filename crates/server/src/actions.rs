@@ -155,7 +155,8 @@ pub fn worktrees(sessions: &Value) -> Vec<Value> {
 
 /// 워크트리에서 새 Claude 를 띄운다. 셸에 명령을 쳐 넣어(tmux-orch.sh 와 같은 방식) 셸 설정·PATH 를 그대로 쓴다.
 /// WORKTABLE_CLAUDE_CMD 로 명령을 바꿀 수 있다(테스트는 `claude --model haiku`).
-pub fn new_session(tmux: &Tmux, sessions: &Value, path: &str) -> Result<Value, String> {
+/// ide_port 가 있으면 CLAUDE_CODE_SSE_PORT 로 넘겨 그 Claude 가 worktable IDE 에 스스로 붙게 한다.
+pub fn new_session(tmux: &Tmux, sessions: &Value, path: &str, ide_port: Option<u16>) -> Result<Value, String> {
     let known = worktrees(sessions);
     let wt = known.iter().find(|w| w["path"].as_str() == Some(path)).ok_or("알려진 워크트리가 아니다")?;
     let name = match wt["issue"].as_u64() {
@@ -163,6 +164,7 @@ pub fn new_session(tmux: &Tmux, sessions: &Value, path: &str) -> Result<Value, S
         None => wt["name"].as_str().unwrap_or("claude").to_string(),
     };
     let dir = Path::new(path);
+    // 세션을 새로 만들었으면 그 첫 window 를 쓰고, 아니면 window 를 더한다.
     let pane = match ensure_home(tmux, Some(dir))? {
         Some(w) => {
             tmux.run(&["rename-window", "-t", &w, &name]);
@@ -172,7 +174,12 @@ pub fn new_session(tmux: &Tmux, sessions: &Value, path: &str) -> Result<Value, S
     }
     .map(|p| p.trim().to_string())
     .ok_or("window 를 만들지 못했다")?;
-    let cmd = env::var("WORKTABLE_CLAUDE_CMD").unwrap_or_else(|_| "claude".into());
+    let base = env::var("WORKTABLE_CLAUDE_CMD").unwrap_or_else(|_| "claude".into());
+    // 환경 변수는 명령 앞에 붙인다 — 세션을 새로 만든 경우에도 같은 방식으로 넘기려고.
+    let cmd = match ide_port {
+        Some(p) => format!("CLAUDE_CODE_SSE_PORT={p} {base}"),
+        None => base,
+    };
     tmux.run(&["send-keys", "-t", &pane, "-l", &cmd]);
     tmux.run(&["send-keys", "-t", &pane, "Enter"]);
     Ok(json!({"pane": pane, "window": name, "path": path}))

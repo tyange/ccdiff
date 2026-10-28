@@ -2,6 +2,7 @@
 //! 브라우저는 화면만 그린다. 파일·터미널·git·프로세스는 모두 이 서버가 맡는다.
 
 mod actions;
+mod changes;
 mod claude;
 mod discover;
 mod guard;
@@ -11,7 +12,14 @@ mod registry;
 mod term;
 mod tmux;
 
-use std::{env, fs, process::Command, sync::Arc, thread, time::Duration};
+use std::{
+    env, fs,
+    path::PathBuf,
+    process::Command,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -28,9 +36,9 @@ use axum::{
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::watch};
 
-use ccdiff_core::secret::random_token;
+use ccdiff_core::{ide::Ide, secret::random_token};
 use guard::{Guard, WS_PROTOCOL};
-use registry::Registry;
+use registry::{Refresher, Selection, Shared};
 use tmux::Tmux;
 
 // web/dist 를 넣은 목록(build.rs 가 만든다). 비어 있으면 임시 페이지를 준다.
@@ -90,6 +98,8 @@ async fn health() -> Json<serde_json::Value> {
 #[derive(Clone)]
 pub struct AppState {
     sessions: watch::Receiver<Value>,
+    reg: Shared,
+    ide: Option<Arc<Mutex<Ide>>>,
     tmux: Tmux,
     plans: Arc<actions::Plans>,
     keys: Arc<term::KeySender>,
@@ -128,7 +138,50 @@ async fn worktrees(State(st): State<AppState>) -> Response {
 /// 새 세션: {"path": "<워크트리>"}.
 async fn new_session(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
     let (path, sessions) = (field(&body, "path"), st.sessions.borrow().clone());
-    blocking(move || actions::new_session(&st.tmux, &sessions, &path)).await
+    let ide_port = st.ide.as_ref().and_then(|i| i.lock().ok().map(|i| i.port));
+    blocking(move || actions::new_session(&st.tmux, &sessions, &path, ide_port)).await
+}
+
+/// 세션의 변경 목록: {"key", "all"}. all 이면 세션 시작 전부터 있던 작업 트리 변경도.
+async fn changes_list(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    let (key, all) = (field(&body, "key"), body["all"].as_bool().unwrap_or(false));
+    blocking(move || changes::list(&*st.reg.lock().map_err(|_| "잠금 실패")?, &key, all)).await
+}
+
+/// 항목 하나의 수정 전후: {"key", "id"}.
+async fn changes_diff(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    let (key, id) = (field(&body, "key"), field(&body, "id"));
+    blocking(move || changes::diff(&*st.reg.lock().map_err(|_| "잠금 실패")?, &key, &id)).await
+}
+
+/// 편집기로 열기: {"key", "id", "line"}.
+async fn open_editor(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    let (key, id, line) = (field(&body, "key"), field(&body, "id"), body["line"].as_u64().unwrap_or(1) as usize);
+    blocking(move || changes::open_in_editor(&*st.reg.lock().map_err(|_| "잠금 실패")?, &key, &id, line)).await
+}
+
+/// 고른 줄을 그 세션의 Claude 에 알린다: {"key", "path", "start", "end", "text"} (줄은 1부터), 비우기는 {"key", "clear": true}.
+/// 그 세션 Claude 에 붙은 IDE 연결에만 보낸다. 나중에 붙는 연결에는 갱신 스레드가 마지막 선택을 다시 보낸다.
+async fn selection(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    let key = field(&body, "key");
+    let path = PathBuf::from(field(&body, "path"));
+    let text = field(&body, "text");
+    let lines = match (body["start"].as_u64(), body["end"].as_u64()) {
+        (Some(a), Some(b)) if !body["clear"].as_bool().unwrap_or(false) && a >= 1 && b >= a => Some((a as usize - 1, b as usize - 1)),
+        _ => None,
+    };
+    let ids = {
+        let Ok(mut reg) = st.reg.lock() else { return StatusCode::INTERNAL_SERVER_ERROR.into_response() };
+        match lines {
+            Some(l) => reg.last_sel.insert(key.clone(), Selection { path: path.clone(), lines: l, text: text.clone() }),
+            None => reg.last_sel.remove(&key),
+        };
+        reg.ide_clients(&key)
+    };
+    if let Some(ide) = st.ide.as_ref().and_then(|i| i.lock().ok()) {
+        ide.select_to(&ids, &path, lines, &text);
+    }
+    Json(json!({"sent": ids.len()})).into_response()
 }
 
 async fn sessions(State(st): State<AppState>) -> Json<Value> {
@@ -161,14 +214,14 @@ async fn serve_events(mut s: WebSocket, mut sessions: watch::Receiver<Value>) {
     }
 }
 
-/// 세션 목록을 2초마다 다시 읽는다. 큰 기록을 처음 읽는 동안에도 API 가 막히지 않게 따로 돈다.
-fn spawn_refresh(tmux: Tmux) -> watch::Receiver<Value> {
+/// 세션 목록을 2초마다 다시 읽는다. 오래 걸리는 일은 잠금 밖에서 해 API 가 막히지 않는다.
+fn spawn_refresh(tmux: Tmux, reg: Shared, ide: Option<Arc<Mutex<Ide>>>) -> watch::Receiver<Value> {
     let (tx, rx) = watch::channel(Value::Array(Vec::new()));
     thread::spawn(move || {
-        let mut reg = Registry::new(tmux);
+        let mut r = Refresher::new(tmux, ide);
         loop {
-            reg.refresh();
-            let snap = reg.snapshot();
+            r.refresh(&reg);
+            let Some(snap) = reg.lock().ok().map(|g| g.snapshot()) else { return };
             tx.send_if_modified(|cur| {
                 let changed = *cur != snap;
                 if changed {
@@ -183,6 +236,16 @@ fn spawn_refresh(tmux: Tmux) -> watch::Receiver<Value> {
         }
     });
     rx
+}
+
+/// Ctrl-C·SIGTERM 을 기다린다 — 끝날 때 IDE 잠금 파일을 지우려고 정상 종료한다.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM 처리기");
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term.recv() => {},
+    }
 }
 
 /// 짝짓기 근거를 사람이 읽게 출력한다.
@@ -265,6 +328,13 @@ async fn main() -> Result<()> {
     // 앞서 죽은 서버가 남긴 보기용 세션을 치운다.
     tmux.sweep_views();
 
+    // Claude Code 의 /ide 가 붙는 곳. 세션마다 그 Claude 의 연결에만 선택을 보낸다.
+    let ide = Ide::start("worktable", Vec::new()).map(|i| Arc::new(Mutex::new(i)));
+    if ide.is_none() {
+        eprintln!("IDE 연결을 열지 못했다 — 줄 선택을 Claude 에 보낼 수 없다");
+    }
+    let reg: Shared = Arc::default();
+
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sessions", get(sessions))
@@ -272,11 +342,17 @@ async fn main() -> Result<()> {
         .route("/api/import", post(import))
         .route("/api/worktrees", get(worktrees))
         .route("/api/sessions/new", post(new_session))
+        .route("/api/changes", post(changes_list))
+        .route("/api/diff", post(changes_diff))
+        .route("/api/open", post(open_editor))
+        .route("/api/selection", post(selection))
         .route("/ws/events", get(events))
         .route("/ws/term/{pane}", get(term::handle))
         .fallback(static_file)
         .with_state(AppState {
-            sessions: spawn_refresh(tmux.clone()),
+            sessions: spawn_refresh(tmux.clone(), reg.clone(), ide.clone()),
+            reg,
+            ide: ide.clone(),
             keys: Arc::new(term::KeySender::new(tmux.clone())),
             tmux,
             plans: Arc::default(),
@@ -288,6 +364,10 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--open") {
         open_app_window(&url);
     }
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    // 갱신 스레드도 IDE 를 들고 있어 Drop 이 돌지 않는다 — 잠금 파일은 직접 지운다.
+    if let Some(i) = ide.as_ref().and_then(|i| i.lock().ok()) {
+        i.remove_lock();
+    }
     Ok(())
 }

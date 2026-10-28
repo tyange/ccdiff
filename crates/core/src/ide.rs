@@ -4,8 +4,8 @@
 
 use std::{
     env, fs,
-    io::ErrorKind,
-    net::{TcpListener, TcpStream},
+    io::{ErrorKind, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -24,11 +24,35 @@ use tungstenite::{
 
 use crate::secret::random_token;
 
-/// 연결마다 (번호, 보낼 통로). 연결이 끊기면 그 스레드가 자기 번호를 지운다.
-type Clients = Arc<Mutex<Vec<(u64, Sender<String>)>>>;
+/// 초기화가 끝난 연결. 연결이 끊기면 그 스레드가 자기 번호를 지운다.
+struct Conn {
+    id: u64,
+    tx: Sender<String>,
+    peer: SocketAddr,
+    /// 선택 알림을 받을 수 있게 되는 시각 — Claude 는 초기화 직후에야 처리기를 단다.
+    ready: Instant,
+}
+
+type Clients = Arc<Mutex<Vec<Conn>>>;
+
+/// 붙어 있는 Claude 하나. peer 로 상대 프로세스를 찾을 수 있다.
+#[derive(Clone, Debug)]
+pub struct Client {
+    pub id: u64,
+    pub peer: SocketAddr,
+    pub ready: bool,
+}
+
+/// 알림 하나를 받을 연결: 모두 또는 정한 번호들.
+enum To<'a> {
+    All,
+    Only(&'a [u64]),
+}
 
 pub struct Ide {
     pub port: u16,
+    /// 잠금 파일의 ideName — Claude 의 `/ide` 목록에 이 이름으로 뜬다.
+    name: String,
     token: String,
     lock: PathBuf,
     folders: Vec<PathBuf>,
@@ -45,29 +69,31 @@ fn alive(pid: u64) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// 강제 종료된 ccdiff 가 남긴 잠금 파일을 치운다 — 남아 있으면 `/ide` 목록에 죽은 후보가 뜬다.
-fn remove_stale(dir: &Path) {
+/// 강제 종료된 같은 이름의 IDE 가 남긴 잠금 파일을 치운다 — 남아 있으면 `/ide` 목록에 죽은 후보가 뜬다.
+fn remove_stale(dir: &Path, name: &str) {
     for e in fs::read_dir(dir).into_iter().flatten().flatten() {
         let Ok(v) = fs::read_to_string(e.path()).map(|t| serde_json::from_str::<Value>(&t).unwrap_or_default()) else { continue };
-        if v["ideName"] == "ccdiff" && v["pid"].as_u64().is_some_and(|p| !alive(p)) {
+        if v["ideName"] == name && v["pid"].as_u64().is_some_and(|p| !alive(p)) {
             let _ = fs::remove_file(e.path());
         }
     }
 }
 
 impl Ide {
-    /// 실패하면 None — 연동만 안 될 뿐 ccdiff 는 그대로 쓴다.
-    pub fn start(mut folders: Vec<PathBuf>) -> Option<Self> {
+    /// 실패하면 None — 연동만 안 될 뿐 쓰는 쪽은 그대로 돈다.
+    /// CCDIFF_IDE_LOG 에 파일 경로가 있으면 Claude 가 보낸 메시지를 그대로 덧붙여 남긴다(규약 실측용).
+    pub fn start(name: &str, mut folders: Vec<PathBuf>) -> Option<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").ok()?;
         let port = listener.local_addr().ok()?.port();
         let token = random_token()?;
         let dir = PathBuf::from(env::var_os("HOME")?).join(".claude/ide");
-        remove_stale(&dir);
+        remove_stale(&dir, name);
         let lock = dir.join(format!("{port}.lock"));
         let mut seen = std::collections::HashSet::new();
         folders.retain(|f| seen.insert(f.clone()));
         let ide = Self {
             port,
+            name: name.to_string(),
             token: token.clone(),
             lock,
             folders,
@@ -76,13 +102,16 @@ impl Ide {
         };
         ide.write_lock().ok()?;
         let (clients, last) = (Arc::clone(&ide.clients), Arc::clone(&ide.last));
+        let log = env::var_os("CCDIFF_IDE_LOG").map(PathBuf::from);
+        let server_name = ide.name.clone();
         thread::spawn(move || {
             for (id, stream) in (0u64..).zip(listener.incoming().flatten()) {
-                let (token, clients, last) = (token.clone(), Arc::clone(&clients), Arc::clone(&last));
+                let (token, clients, last, log, name) =
+                    (token.clone(), Arc::clone(&clients), Arc::clone(&last), log.clone(), server_name.clone());
                 thread::spawn(move || {
-                    serve(id, stream, &token, &clients, &last);
+                    serve(Peer { id, name: &name, token: &token, log: log.as_deref() }, stream, &clients, &last);
                     if let Ok(mut cs) = clients.lock() {
-                        cs.retain(|(i, _)| *i != id);
+                        cs.retain(|c| c.id != id);
                     }
                 });
             }
@@ -97,7 +126,7 @@ impl Ide {
         let body = json!({
             "pid": std::process::id(),
             "workspaceFolders": self.folders,
-            "ideName": "ccdiff",
+            "ideName": self.name,
             "transport": "ws",
             "authToken": self.token,
         });
@@ -108,6 +137,11 @@ impl Ide {
             fs::set_permissions(&self.lock, fs::Permissions::from_mode(0o600))?;
         }
         Ok(())
+    }
+
+    /// 잠금 파일을 지운다 — Drop 이 돌지 않는 채로 끝날 때(다른 스레드가 들고 있을 때) 쓴다.
+    pub fn remove_lock(&self) {
+        let _ = fs::remove_file(&self.lock);
     }
 
     /// 세션이 새 워크트리를 다루기 시작하면 그 워크트리의 Claude 도 고를 수 있게 한다.
@@ -122,32 +156,59 @@ impl Ide {
         self.clients.lock().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// 초기화가 끝난 연결들.
+    pub fn clients(&self) -> Vec<Client> {
+        let now = Instant::now();
+        self.clients
+            .lock()
+            .map(|cs| cs.iter().map(|c| Client { id: c.id, peer: c.peer, ready: now >= c.ready }).collect())
+            .unwrap_or_default()
+    }
+
+    /// 모든 연결에 알린다. 마지막 선택은 나중에 붙는 연결에도 다시 보낸다.
     /// lines 는 0부터 센 [start, end] 줄. None 이면 선택을 비운다.
     pub fn select(&self, path: &Path, lines: Option<(usize, usize)>, text: &str) {
-        let params = match lines {
-            Some((s, e)) => json!({
-                "text": text,
-                "filePath": path,
-                "fileUrl": format!("file://{}", path.display()),
-                "selection": {
-                    "start": {"line": s, "character": 0},
-                    "end": {"line": e, "character": text.lines().last().map(|l| l.chars().count()).unwrap_or(0).max(1)},
-                    "isEmpty": false,
-                },
-            }),
-            // 경로까지 비운다 — 경로만 남기면 Claude 가 "그 파일을 열어 둔 상태" 로 받아들인다.
-            None => json!({
-                "selection": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}, "isEmpty": true},
-            }),
-        };
-        let msg = json!({"jsonrpc": "2.0", "method": "selection_changed", "params": params}).to_string();
+        let msg = selection_message(path, lines, text);
         if let Ok(mut l) = self.last.lock() {
             *l = lines.map(|_| msg.clone());
         }
+        self.send(To::All, &msg);
+    }
+
+    /// 정한 연결에만 알린다(세션마다 다른 Claude 에 보낼 때). 나중에 붙는 연결에 다시 보내는 일은 쓰는 쪽이 한다.
+    pub fn select_to(&self, ids: &[u64], path: &Path, lines: Option<(usize, usize)>, text: &str) {
+        self.send(To::Only(ids), &selection_message(path, lines, text));
+    }
+
+    fn send(&self, to: To, msg: &str) {
         if let Ok(mut cs) = self.clients.lock() {
-            cs.retain(|(_, tx)| tx.send(msg.clone()).is_ok());
+            cs.retain(|c| match to {
+                To::Only(ids) if !ids.contains(&c.id) => true,
+                _ => c.tx.send(msg.to_string()).is_ok(),
+            });
         }
     }
+}
+
+/// lines 는 0부터 센 [start, end] 줄. None 이면 선택을 비운다.
+fn selection_message(path: &Path, lines: Option<(usize, usize)>, text: &str) -> String {
+    let params = match lines {
+        Some((s, e)) => json!({
+            "text": text,
+            "filePath": path,
+            "fileUrl": format!("file://{}", path.display()),
+            "selection": {
+                "start": {"line": s, "character": 0},
+                "end": {"line": e, "character": text.lines().last().map(|l| l.chars().count()).unwrap_or(0).max(1)},
+                "isEmpty": false,
+            },
+        }),
+        // 경로까지 비운다 — 경로만 남기면 Claude 가 "그 파일을 열어 둔 상태" 로 받아들인다.
+        None => json!({
+            "selection": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}, "isEmpty": true},
+        }),
+    };
+    json!({"jsonrpc": "2.0", "method": "selection_changed", "params": params}).to_string()
 }
 
 impl Drop for Ide {
@@ -156,7 +217,17 @@ impl Drop for Ide {
     }
 }
 
-fn serve(id: u64, stream: TcpStream, token: &str, clients: &Clients, last: &Mutex<Option<String>>) {
+/// 연결 하나의 정보.
+struct Peer<'a> {
+    id: u64,
+    name: &'a str,
+    token: &'a str,
+    log: Option<&'a Path>,
+}
+
+fn serve(p: Peer, stream: TcpStream, clients: &Clients, last: &Mutex<Option<String>>) {
+    let token = p.token;
+    let Ok(peer) = stream.peer_addr() else { return };
     let check = |req: &Request, mut resp: Response| {
         let ok = req
             .headers()
@@ -180,8 +251,13 @@ fn serve(id: u64, stream: TcpStream, token: &str, clients: &Clients, last: &Mute
     loop {
         match ws.read() {
             Ok(Message::Text(t)) => {
+                if let Some(log) = p.log {
+                    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(log) {
+                        let _ = writeln!(f, "{t}");
+                    }
+                }
                 let Ok(req) = serde_json::from_str::<Value>(&t) else { continue };
-                if let Some(reply) = answer(&req) {
+                if let Some(reply) = answer(&req, p.name) {
                     if ws.send(Message::text(reply.to_string())).is_err() {
                         break;
                     }
@@ -189,10 +265,11 @@ fn serve(id: u64, stream: TcpStream, token: &str, clients: &Clients, last: &Mute
                 // 초기화가 끝난 뒤부터 알림을 받는다.
                 if req["method"] == "notifications/initialized" {
                     if let Some(tx) = registered.take() {
+                        let ready = Instant::now() + Duration::from_millis(1500);
                         if let Ok(mut cs) = clients.lock() {
-                            cs.push((id, tx));
+                            cs.push(Conn { id: p.id, tx, peer, ready });
                         }
-                        resend_at = Some(Instant::now() + Duration::from_millis(1500));
+                        resend_at = Some(ready);
                     }
                 }
             }
@@ -218,13 +295,13 @@ fn serve(id: u64, stream: TcpStream, token: &str, clients: &Clients, last: &Mute
 }
 
 /// 도구는 내놓지 않는다 — 선택 알림만 쓰는 연결이다.
-fn answer(req: &Value) -> Option<Value> {
+fn answer(req: &Value, name: &str) -> Option<Value> {
     let id = req.get("id")?.clone();
     let result = match req["method"].as_str()? {
         "initialize" => json!({
             "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "ccdiff", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": name, "version": env!("CARGO_PKG_VERSION")},
         }),
         "tools/list" => json!({"tools": []}),
         "prompts/list" => json!({"prompts": []}),
