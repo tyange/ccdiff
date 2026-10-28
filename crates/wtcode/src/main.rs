@@ -2,6 +2,7 @@
 //! 연 뒤에도 꺼지지 않는다 — tmux pane 에 띄워 두고 쓴다. 워크트리와 투두 파일이 바뀌면 화면이 따라 바뀐다.
 
 mod render;
+mod target;
 mod todo;
 
 use std::{
@@ -117,6 +118,8 @@ enum Mode {
     Adding(String),
     /// 지울지 묻는 중(줄 번호, 그 줄).
     Deleting(usize, String),
+    /// 보낼 Claude 세션 고르는 중(목록, 고른 칸, 고른 뒤 보낼 것: 글, Enter 까지 칠지).
+    Picking(Vec<target::ClaudePane>, usize, Option<(String, bool)>),
 }
 
 struct Todo {
@@ -172,6 +175,8 @@ struct App {
     focus: Focus,
     mode: Mode,
     notice: Option<(String, Instant)>,
+    /// 투두를 보낼 Claude pane.
+    target: Option<target::ClaudePane>,
     listed_at: Instant,
     dirty_at: Instant,
     tx: Sender<(PathBuf, usize)>,
@@ -290,6 +295,20 @@ impl App {
                 }
                 return false;
             }
+            Mode::Picking(list, at, pending) => {
+                match k.code {
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    KeyCode::Char('j') | KeyCode::Down => *at = (*at + 1).min(list.len().saturating_sub(1)),
+                    KeyCode::Char('k') | KeyCode::Up => *at = at.saturating_sub(1),
+                    KeyCode::Enter => {
+                        let (pick, pending) = (list.get(*at).cloned(), pending.take());
+                        self.mode = Mode::Normal;
+                        self.pick(pick, pending);
+                    }
+                    _ => {}
+                }
+                return false;
+            }
             Mode::Normal => {}
         }
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
@@ -300,6 +319,7 @@ impl App {
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = if self.focus == Focus::Worktrees { Focus::Todo } else { Focus::Worktrees };
             }
+            KeyCode::Char('t') => self.open_picker(None),
             KeyCode::Char('a') => {
                 self.focus = Focus::Todo;
                 self.mode = Mode::Adding(String::new());
@@ -309,6 +329,14 @@ impl App {
                 self.todo.reload(true);
             }
             _ if self.focus == Focus::Todo => match k.code {
+                KeyCode::Char('p') => self.send_selected(false),
+                KeyCode::Char('P') => self.send_selected(true),
+                KeyCode::Char('y') => {
+                    if let Some(text) = self.selected_text() {
+                        let r = target::copy(&text).map(|_| format!("복사했다: {text}"));
+                        self.say(r.unwrap_or_else(|e| e));
+                    }
+                }
                 KeyCode::Char('j') | KeyCode::Down => self.todo.move_by(1),
                 KeyCode::Char('k') | KeyCode::Up => self.todo.move_by(-1),
                 KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('x') => self.toggle_todo(),
@@ -329,7 +357,60 @@ impl App {
         false
     }
 
+    /// 고른 투두의 글(체크박스 표시를 뺀 것).
+    fn selected_text(&self) -> Option<String> {
+        let l = self.todo.lines.get(self.todo.sel?)?;
+        todo::task(l)?;
+        Some(l.trim_start()[5..].trim().to_string())
+    }
+
+    fn open_picker(&mut self, pending: Option<(String, bool)>) {
+        let list = target::claude_panes();
+        if list.is_empty() {
+            self.say("Claude 가 도는 tmux pane 을 찾지 못했다");
+            return;
+        }
+        let at = self.target.as_ref().and_then(|t| list.iter().position(|p| p.id == t.id)).unwrap_or(0);
+        self.mode = Mode::Picking(list, at, pending);
+    }
+
+    fn pick(&mut self, pick: Option<target::ClaudePane>, pending: Option<(String, bool)>) {
+        let Some(p) = pick else { return };
+        self.say(format!("보낼 세션: {}", p.label));
+        self.target = Some(p);
+        if let Some((text, submit)) = pending {
+            self.send(&text, submit);
+        }
+    }
+
+    fn send(&mut self, text: &str, submit: bool) {
+        let Some(t) = self.target.clone().filter(|t| target::alive(&t.id)) else {
+            // 대상이 없거나 사라졌으면 고른 뒤 보낸다.
+            self.open_picker(Some((text.to_string(), submit)));
+            return;
+        };
+        let r = target::send(&t.id, text, submit).map(|_| format!("{} {}: {text}", t.label, if submit { "← 보냄" } else { "← 넣음" }));
+        self.say(r.unwrap_or_else(|e| e));
+    }
+
+    fn send_selected(&mut self, submit: bool) {
+        if let Some(text) = self.selected_text() {
+            self.send(&text, submit);
+        }
+    }
+
     fn on_click(&mut self, col: u16, row: u16) {
+        // 고르기 목록이 떠 있으면 누른 줄을 고른다.
+        if let Mode::Picking(list, _, pending) = &mut self.mode {
+            let t = self.todo.area;
+            let i = row.saturating_sub(t.y + 1) as usize;
+            if row > t.y && i < list.len() {
+                let (pick, pending) = (list.get(i).cloned(), pending.take());
+                self.mode = Mode::Normal;
+                self.pick(pick, pending);
+            }
+            return;
+        }
         let a = self.list_area;
         if row > a.y && row < a.y + a.height.saturating_sub(1) && col >= a.x && col < a.x + a.width {
             self.focus = Focus::Worktrees;
@@ -421,7 +502,8 @@ fn draw_todo(f: &mut Frame, app: &mut App, area: Rect) {
     }
     t.scroll = t.scroll.min(rows.len().saturating_sub(h));
     t.rows_src = rows.iter().map(|r| r.src).collect();
-    let title = format!(" 투두 · {} ", t.path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default());
+    let to = app.target.as_ref().map(|p| format!(" → {}", p.label)).unwrap_or_default();
+    let title = format!(" 투두 · {}{to} ", t.path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default());
     let p = Paragraph::new(rows.into_iter().map(|r| r.line).collect::<Vec<_>>())
         .block(Block::default().borders(Borders::ALL).border_style(border(focused)).title(title))
         .scroll((t.scroll as u16, 0));
@@ -436,16 +518,31 @@ fn draw(f: &mut Frame, app: &mut App) {
     let [top, bottom] = Layout::vertical([Constraint::Length(wt_h), Constraint::Min(3)]).areas(main);
     draw_worktrees(f, app, top);
     draw_todo(f, app, bottom);
+    if let Mode::Picking(list, at, _) = &app.mode {
+        // 투두 칸 자리에 고르기 목록을 띄운다.
+        let items: Vec<ListItem> = list.iter().map(|p| ListItem::new(p.label.clone())).collect();
+        let mut st = ListState::default().with_selected(Some(*at));
+        f.render_widget(ratatui::widgets::Clear, bottom);
+        f.render_stateful_widget(
+            List::new(items)
+                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title(" 투두를 보낼 Claude 세션 "))
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("▶ "),
+            bottom,
+            &mut st,
+        );
+    }
     let gray = Style::default().fg(Color::DarkGray);
     let text = match &app.mode {
         Mode::Adding(buf) => Line::from(vec![Span::styled(" 새 투두: ", Style::default().fg(Color::Yellow)), Span::raw(format!("{buf}▌")), Span::styled("  Enter 추가 · Esc 취소", gray)]),
+        Mode::Picking(..) => Line::from(Span::styled(" ↑↓·클릭 고르기 · Enter 정하기 · Esc 닫기", gray)),
         Mode::Deleting(at, _) => Line::from(Span::styled(
             format!(" 지울까? y/n — {}", app.todo.lines.get(*at).map(|l| l.trim()).unwrap_or("")),
             Style::default().fg(Color::Yellow),
         )),
         Mode::Normal => match &app.notice {
             Some((m, at)) if at.elapsed() < Duration::from_secs(4) => Line::from(Span::styled(format!(" {m}"), gray)),
-            _ if app.focus == Focus::Todo => Line::from(Span::styled(" ↑↓ 이동 · space·클릭 체크 · a 추가 · d 지우기 · Tab 워크트리 · q 종료", gray)),
+            _ if app.focus == Focus::Todo => Line::from(Span::styled(" space 체크 · p 세션에 넣기 · P 보내기 · y 복사 · t 세션 고르기 · a 추가 · d 지우기 · Tab", gray)),
             _ => Line::from(Span::styled(" ↑↓ 이동 · Enter·클릭 VS Code · Tab 투두 · a 투두 추가 · r 새로고침 · q 종료", gray)),
         },
     };
@@ -523,6 +620,7 @@ fn main() -> Result<()> {
         focus: Focus::Worktrees,
         mode: Mode::Normal,
         notice: None,
+        target: None,
         listed_at: Instant::now(),
         dirty_at: Instant::now(),
         tx,
@@ -530,6 +628,7 @@ fn main() -> Result<()> {
     };
     app.reload(true);
     app.todo.reload(true);
+    app.target = target::default_target(&target::claude_panes());
     if app.items.is_empty() {
         bail!("워크트리를 읽지 못했다: {}", app.repo.display());
     }
