@@ -123,6 +123,24 @@ fn epoch(ts: Option<&str>) -> i64 {
 }
 
 /// 기록 한 줄의 timestamp(유닉스 초). 없으면 0.
+/// 기록 줄 자신의 uuid. `parentUuid` 와는 대소문자로 갈린다.
+pub fn line_uuid(line: &str) -> Option<String> {
+    let key = "\"uuid\":\"";
+    let rest = &line[line.find(key)? + key.len()..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+/// compact 로 새로 시작한 세션이면 앞 세션 마지막 줄의 uuid. 경계 줄은 파일 첫머리에 있다.
+pub fn compact_parent(path: &Path) -> Option<String> {
+    let mut head = Vec::new();
+    File::open(path).ok()?.take(256 * 1024).read_to_end(&mut head).ok()?;
+    let text = String::from_utf8_lossy(&head);
+    let line = text.lines().find(|l| l.contains("\"subtype\":\"compact_boundary\""))?;
+    let key = "\"logicalParentUuid\":\"";
+    let rest = &line[line.find(key)? + key.len()..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
 /// 기록 줄의 `cwd`. 이 값을 가진 줄은 많다 — 문자열로만 꺼낸다.
 pub fn line_cwd(line: &str) -> Option<PathBuf> {
     let key = "\"cwd\":\"";

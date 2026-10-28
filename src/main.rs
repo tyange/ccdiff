@@ -73,7 +73,15 @@ impl Sel {
 
 pub struct App {
     pub session: String,
-    tail: Tail,
+    /// 읽는 기록들: 처음 연 세션, compact 로 이어진 세션, 그 서브에이전트들.
+    tails: Vec<Tail>,
+    /// 세션 본 기록 사슬(처음 연 것부터). 서브에이전트는 빠진다.
+    chain: Vec<PathBuf>,
+    /// 이미 읽거나 이어짐이 아니라고 본 기록 파일.
+    known: HashSet<PathBuf>,
+    /// 읽은 줄의 uuid — 이어진 세션은 앞 세션 줄을 옮겨 담아 시작하므로 겹치는 줄을 거른다.
+    seen: HashSet<String>,
+    found_at: Option<Instant>,
     roots: HashMap<PathBuf, Option<PathBuf>>,
     pub entries: Vec<EditEntry>,
     repo_order: Vec<Option<PathBuf>>,
@@ -150,7 +158,20 @@ fn load_expanded() -> HashSet<Option<PathBuf>> {
 impl App {
     fn ingest(&mut self) -> Result<bool> {
         let mut changed = false;
-        for line in self.tail.read_lines()? {
+        let mut lines = Vec::new();
+        for (i, t) in self.tails.iter_mut().enumerate() {
+            match t.read_lines() {
+                Ok(l) => lines.extend(l),
+                Err(e) if i == 0 => return Err(e),
+                Err(_) => {}
+            }
+        }
+        for line in lines {
+            if let Some(u) = session::line_uuid(&line) {
+                if !self.seen.insert(u) {
+                    continue;
+                }
+            }
             if self.session_start == 0 {
                 self.session_start = session::line_epoch(&line);
             }
@@ -190,7 +211,12 @@ impl App {
                         fv.seq.insert(at, key);
                     }
                 }
+                let late = self.entries.last().is_some_and(|l| l.epoch > e.epoch);
                 self.entries.push(e);
+                // 서브에이전트 기록은 본 기록과 따로 읽혀 시간순이 어긋날 수 있다.
+                if late {
+                    self.sort_file_seq();
+                }
                 changed = true;
             }
         }
@@ -198,6 +224,78 @@ impl App {
             self.select_last();
         }
         Ok(changed)
+    }
+
+    fn sort_file_seq(&mut self) {
+        let Some(mut fv) = self.file.take() else { return };
+        let cur = fv.seq[fv.pos];
+        fv.seq.sort_by_key(|&k| (k >= WT, self.entry(k).epoch));
+        fv.pos = fv.seq.iter().position(|&k| k == cur).unwrap_or(0);
+        self.file = Some(fv);
+    }
+
+    fn add_tail(&mut self, p: PathBuf) {
+        self.known.insert(p.clone());
+        self.tails.push(Tail::new(p));
+    }
+
+    /// 새로 생긴 서브에이전트 기록과 compact 로 이어진 세션 기록을 찾아 읽기 목록에 넣는다.
+    fn discover(&mut self) -> bool {
+        let before = self.tails.len();
+        let dir = self.chain[0].parent().map(PathBuf::from).unwrap_or_default();
+        // 사슬이 길어지면 새 꼬리가 또 이어질 수 있어 더 찾을 게 없을 때까지 돈다.
+        loop {
+            let mut next = None;
+            for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.extension().is_none_or(|x| x != "jsonl") || self.known.contains(&p) {
+                    continue;
+                }
+                match session::compact_parent(&p) {
+                    Some(u) if self.seen.contains(&u) => {
+                        next = Some(p);
+                        break;
+                    }
+                    Some(_) => {
+                        self.known.insert(p);
+                    }
+                    // 막 생긴 파일은 경계 줄이 아직 안 써졌을 수 있다 — 조금 지난 것만 제외한다.
+                    None => {
+                        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                        if old.is_some_and(|d| d > Duration::from_secs(30)) {
+                            self.known.insert(p);
+                        }
+                    }
+                }
+            }
+            let Some(p) = next else { break };
+            self.chain.push(p.clone());
+            self.add_tail(p);
+            // 이어진 기록의 줄을 읽어야 그 다음 이어짐의 부모 uuid 를 알 수 있다.
+            let _ = self.ingest();
+        }
+        for s in self.chain.clone() {
+            let dir = s.with_extension("").join("subagents");
+            for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "jsonl") && !self.known.contains(&p) {
+                    self.add_tail(p);
+                }
+            }
+        }
+        if self.chain.len() > 1 {
+            let stem = |p: &PathBuf| p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            self.session = format!("{} (compact 로 {}번 이어짐)", stem(self.chain.last().expect("chain")), self.chain.len() - 1);
+        }
+        self.tails.len() > before
+    }
+
+    fn maybe_discover(&mut self) {
+        if self.found_at.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+            return;
+        }
+        self.found_at = Some(Instant::now());
+        self.discover();
     }
 
     pub fn entry(&self, key: usize) -> &EditEntry {
@@ -843,6 +941,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 }
             }
         }
+        app.maybe_discover();
         app.ingest()?;
     }
 }
@@ -903,7 +1002,11 @@ fn main() -> Result<()> {
 
     let mut app = App {
         session,
-        tail: Tail::new(path),
+        tails: vec![Tail::new(path.clone())],
+        chain: vec![path.clone()],
+        known: HashSet::from([path]),
+        seen: HashSet::new(),
+        found_at: None,
         roots: HashMap::new(),
         entries: Vec::new(),
         repo_order: Vec::new(),
@@ -939,6 +1042,8 @@ fn main() -> Result<()> {
         sent: None,
         cwd: None,
     };
+    app.ingest()?;
+    app.discover();
     app.ingest()?;
     if list_only || args_verify() {
         app.sync_git();
